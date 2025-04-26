@@ -1,0 +1,20 @@
+[package]
+name    = "wabi_tree"
+version = "0.0.0"
+edition = "2024"
+
+authors         = ["Chris Reynolds chris@reynolds.guru"]
+description     = "Weight-Balanced Order Statistic Tree written in Rust."
+license         = "MIT OR Apache-2.0"
+readme          = "README.md"
+repository      = "https://github.com/ckmjreynolds/wabi_tree"
+keywords        = ["weight balanced tree", "order statistic tree", "binary search tree"]
+categories      = ["data-structures", "compression"]
+documentation   = "https://docs.rs/lzr"
+
+include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
+
+[dependencies]
+
+[dev-dependencies]
+pretty_assertions = ">=1.4.1"
