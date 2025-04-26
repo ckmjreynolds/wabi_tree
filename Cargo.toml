@@ -8,7 +8,7 @@ description     = "Weight-Balanced Order Statistic Tree written in Rust."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/wabi_tree"
-keywords        = ["weight balanced tree", "order statistic tree", "binary search tree"]
+keywords        = ["bst", "ost", "wbt"]
 categories      = ["data-structures", "compression"]
 documentation   = "https://docs.rs/lzr"
 
