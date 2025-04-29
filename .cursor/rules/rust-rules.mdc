@@ -1,0 +1,16 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Use Test-Driven Development (TDD)
+We use TDD in this project. You should expect to run tests without prompting. You will usually be brought in after a failing test has been written.
+
+# Iterate to fix lint, build, and test failures.
+You should iterate to fix any lint or build errors or test failures without prompting.
+
+# Follow DRY
+Where possible, follow Don't Repeat Yourself (DRY), refactoring as needed.
+
+# When running "git diff" do not use a pager.
+git --no-pager diff
