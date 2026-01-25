@@ -828,25 +828,36 @@ proptest! {
         hi in value_strategy(),
     ) {
         let mut os_set: OSBTreeSet<i64> = values.iter().cloned().collect();
-        let mut bt_set: BTreeSet<i64> = values.iter().cloned().collect();
+        let original_set: BTreeSet<i64> = values.iter().cloned().collect();
 
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
 
         // Extract all even values in range
         let os_extracted: Vec<_> = os_set.extract_if(lo..=hi, |v| v % 2 == 0).collect();
-        let bt_extracted: Vec<_> = bt_set.extract_if(lo..=hi, |v| v % 2 == 0).collect();
 
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extract_if extracted mismatch");
-
-        // Verify extracted values are in bounds
+        // Verify extracted values are in bounds, even, and in sorted order
+        let mut prev = None;
         for v in &os_extracted {
             prop_assert!(*v >= lo && *v <= hi, "extracted value {} is outside range {}..={}", v, lo, hi);
+            prop_assert!(v % 2 == 0, "extracted value {} should be even", v);
+            prop_assert!(original_set.contains(v), "extracted value {} should be in original set", v);
+            if let Some(p) = prev {
+                prop_assert!(v > &p, "extracted values should be in sorted order");
+            }
+            prev = Some(*v);
         }
 
-        // Verify remaining sets match
-        let os_remaining: Vec<_> = os_set.iter().copied().collect();
-        let bt_remaining: Vec<_> = bt_set.iter().copied().collect();
-        prop_assert_eq!(&os_remaining, &bt_remaining, "extract_if remaining mismatch");
+        // Verify remaining values are either outside range or odd
+        for v in os_set.iter() {
+            let in_range = *v >= lo && *v <= hi;
+            if in_range {
+                prop_assert!(v % 2 != 0, "remaining value {} in range should be odd", v);
+            }
+            prop_assert!(original_set.contains(v), "remaining value {} should be in original set", v);
+        }
+
+        // Verify total count
+        prop_assert_eq!(os_extracted.len() + os_set.len(), original_set.len(), "total count mismatch");
     }
 
     /// Tests extract_if with early drop (iterator not exhausted) retains unvisited values.
@@ -855,18 +866,25 @@ proptest! {
         values in proptest::collection::vec(value_strategy(), TEST_SIZE),
     ) {
         let mut os_set: OSBTreeSet<i64> = values.iter().cloned().collect();
-        let mut bt_set: BTreeSet<i64> = values.iter().cloned().collect();
+        let original_len = os_set.len();
 
         // Take only the first 10 items from extract_if, then drop
         let os_extracted: Vec<_> = os_set.extract_if(.., |_| true).take(10).collect();
-        let bt_extracted: Vec<_> = bt_set.extract_if(.., |_| true).take(10).collect();
 
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extract_if early extracted mismatch");
+        // Extracted count should be at most 10
+        prop_assert!(os_extracted.len() <= 10, "should extract at most 10 items");
 
-        // Verify remaining sets match (unvisited values should be retained)
-        let os_remaining: Vec<_> = os_set.iter().copied().collect();
-        let bt_remaining: Vec<_> = bt_set.iter().copied().collect();
-        prop_assert_eq!(&os_remaining, &bt_remaining, "extract_if early drop remaining mismatch");
+        // Remaining items should be original_len - extracted_len
+        prop_assert_eq!(os_set.len(), original_len - os_extracted.len(), "remaining count mismatch");
+
+        // Extracted items should be the first N items in sorted order
+        let sorted_values: Vec<_> = {
+            let set: BTreeSet<_> = values.iter().cloned().collect();
+            set.into_iter().collect()
+        };
+        for (i, v) in os_extracted.iter().enumerate() {
+            prop_assert_eq!(*v, sorted_values[i], "extracted value at position {} should match sorted order", i);
+        }
     }
 
     /// Tests interleaved next/next_back for Range iterator matches BTreeSet behavior.

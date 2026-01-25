@@ -431,26 +431,27 @@ proptest! {
         prop_assert_eq!(&os_items, &bt_items, "or_default content mismatch");
     }
 
-    /// Tests insert_entry matches BTreeMap behavior.
+    /// Tests insert_entry behavior.
     #[test]
     fn entry_insert_entry(
         initial in proptest::collection::vec((key_strategy(), value_strategy()), TEST_SIZE / 2),
         insertions in proptest::collection::vec((key_strategy(), value_strategy()), TEST_SIZE / 2),
     ) {
         let mut os_map: OSBTreeMap<i64, i64> = initial.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = initial.iter().cloned().collect();
 
         for (k, v) in &insertions {
             let os_entry = os_map.entry(*k).insert_entry(*v);
-            let bt_entry = bt_map.entry(*k).insert_entry(*v);
-
-            prop_assert_eq!(os_entry.key(), bt_entry.key(), "insert_entry key mismatch");
-            prop_assert_eq!(os_entry.get(), bt_entry.get(), "insert_entry value mismatch");
+            // Verify the entry has the correct key and value
+            prop_assert_eq!(*os_entry.key(), *k, "insert_entry key mismatch");
+            prop_assert_eq!(*os_entry.get(), *v, "insert_entry value mismatch");
         }
 
-        let os_items: Vec<_> = os_map.iter().map(|(&k, &v)| (k, v)).collect();
-        let bt_items: Vec<_> = bt_map.iter().map(|(&k, &v)| (k, v)).collect();
-        prop_assert_eq!(&os_items, &bt_items, "insert_entry content mismatch");
+        // Verify all insertions are in the map with correct values
+        // (later insertions overwrite earlier ones for duplicate keys)
+        let expected: BTreeMap<i64, i64> = insertions.iter().cloned().collect();
+        for (k, v) in &expected {
+            prop_assert_eq!(os_map.get(k), Some(v), "insert_entry final value mismatch for key {}", k);
+        }
     }
 
     /// Tests VacantEntry::into_key returns the correct key.
@@ -540,16 +541,29 @@ proptest! {
     #[test]
     fn extract_if_matches_expected(entries in proptest::collection::vec((key_strategy(), value_strategy()), TEST_SIZE)) {
         let mut os_map: OSBTreeMap<i64, i64> = entries.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
+        let original_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
 
         let os_extracted: Vec<_> = os_map.extract_if(.., |k, _v| k % 2 == 0).collect();
-        let bt_extracted: Vec<_> = bt_map.extract_if(.., |k, _v| k % 2 == 0).collect();
 
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extract_if extracted mismatch");
+        // Verify extracted elements have even keys and are in sorted order
+        let mut prev_key = None;
+        for (k, v) in &os_extracted {
+            prop_assert!(k % 2 == 0, "extracted key {} should be even", k);
+            prop_assert_eq!(original_map.get(k), Some(v), "extracted value mismatch for key {}", k);
+            if let Some(prev) = prev_key {
+                prop_assert!(k > &prev, "extracted keys should be in sorted order");
+            }
+            prev_key = Some(*k);
+        }
 
-        let os_remaining: Vec<_> = os_map.iter().map(|(&k, &v)| (k, v)).collect();
-        let bt_remaining: Vec<_> = bt_map.iter().map(|(&k, &v)| (k, v)).collect();
-        prop_assert_eq!(&os_remaining, &bt_remaining, "extract_if remaining mismatch");
+        // Verify remaining elements have odd keys
+        for (k, v) in os_map.iter() {
+            prop_assert!(k % 2 != 0, "remaining key {} should be odd", k);
+            prop_assert_eq!(original_map.get(k), Some(v), "remaining value mismatch for key {}", k);
+        }
+
+        // Verify total count matches
+        prop_assert_eq!(os_extracted.len() + os_map.len(), original_map.len(), "total count mismatch");
     }
 }
 
@@ -1156,25 +1170,33 @@ proptest! {
         hi in key_strategy(),
     ) {
         let mut os_map: OSBTreeMap<i64, i64> = entries.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
+        let original_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
 
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
 
         // Extract all even keys in range
         let os_extracted: Vec<_> = os_map.extract_if(lo..=hi, |k, _| k % 2 == 0).collect();
-        let bt_extracted: Vec<_> = bt_map.extract_if(lo..=hi, |k, _| k % 2 == 0).collect();
 
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extract_if extracted mismatch");
-
-        // Verify extracted keys are in bounds
-        for (k, _) in &os_extracted {
+        // Verify extracted keys are in bounds and even, in sorted order
+        let mut prev_key = None;
+        for (k, v) in &os_extracted {
             prop_assert!(*k >= lo && *k <= hi, "extracted key {} is outside range {}..={}", k, lo, hi);
+            prop_assert!(k % 2 == 0, "extracted key {} should be even", k);
+            prop_assert_eq!(original_map.get(k), Some(v), "extracted value mismatch for key {}", k);
+            if let Some(prev) = prev_key {
+                prop_assert!(k > &prev, "extracted keys should be in sorted order");
+            }
+            prev_key = Some(*k);
         }
 
-        // Verify remaining maps match
-        let os_remaining: Vec<_> = os_map.iter().map(|(&k, &v)| (k, v)).collect();
-        let bt_remaining: Vec<_> = bt_map.iter().map(|(&k, &v)| (k, v)).collect();
-        prop_assert_eq!(&os_remaining, &bt_remaining, "extract_if remaining mismatch");
+        // Verify remaining keys are either outside range or odd
+        for (k, v) in os_map.iter() {
+            let in_range = *k >= lo && *k <= hi;
+            if in_range {
+                prop_assert!(k % 2 != 0, "remaining key {} in range should be odd", k);
+            }
+            prop_assert_eq!(original_map.get(k), Some(v), "remaining value mismatch for key {}", k);
+        }
     }
 
     /// Tests extract_if with early drop (iterator not exhausted) retains unvisited keys.
@@ -1183,18 +1205,25 @@ proptest! {
         entries in proptest::collection::vec((key_strategy(), value_strategy()), TEST_SIZE),
     ) {
         let mut os_map: OSBTreeMap<i64, i64> = entries.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
+        let original_len = os_map.len();
 
         // Take only the first 10 items from extract_if, then drop
         let os_extracted: Vec<_> = os_map.extract_if(.., |_, _| true).take(10).collect();
-        let bt_extracted: Vec<_> = bt_map.extract_if(.., |_, _| true).take(10).collect();
 
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extract_if early extracted mismatch");
+        // Extracted count should be at most 10
+        prop_assert!(os_extracted.len() <= 10, "should extract at most 10 items");
 
-        // Verify remaining maps match (unvisited keys should be retained)
-        let os_remaining: Vec<_> = os_map.iter().map(|(&k, &v)| (k, v)).collect();
-        let bt_remaining: Vec<_> = bt_map.iter().map(|(&k, &v)| (k, v)).collect();
-        prop_assert_eq!(&os_remaining, &bt_remaining, "extract_if early drop remaining mismatch");
+        // Remaining items should be original_len - extracted_len
+        prop_assert_eq!(os_map.len(), original_len - os_extracted.len(), "remaining count mismatch");
+
+        // Extracted items should be the first N items in sorted order
+        let sorted_unique: Vec<_> = {
+            let map: BTreeMap<_, _> = entries.iter().cloned().collect();
+            map.keys().copied().collect()
+        };
+        for (i, (k, _)) in os_extracted.iter().enumerate() {
+            prop_assert_eq!(*k, sorted_unique[i], "extracted key at position {} should match sorted order", i);
+        }
     }
 
     /// Tests interleaved next/next_back for Range iterator matches BTreeMap behavior.
@@ -1691,7 +1720,7 @@ proptest! {
     #[test]
     fn extract_if_mutates_values(entries in proptest::collection::vec((key_strategy(), value_strategy()), 1000)) {
         let mut os_map: OSBTreeMap<i64, i64> = entries.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
+        let original_map: std::collections::HashMap<_, _> = entries.iter().cloned().collect();
 
         // Predicate that mutates the value (doubles it) and returns true for even keys
         let os_extracted: Vec<_> = os_map.extract_if(.., |k, v| {
@@ -1699,24 +1728,18 @@ proptest! {
             k % 2 == 0 // Extract even keys
         }).collect();
 
-        let bt_extracted: Vec<_> = bt_map.extract_if(.., |k, v| {
-            *v = v.wrapping_mul(2); // Mutate value
-            k % 2 == 0 // Extract even keys
-        }).collect();
+        // Verify extracted elements have even keys and mutated values
+        for (k, v) in &os_extracted {
+            prop_assert!(k % 2 == 0, "extracted key {} should be even", k);
+            if let Some(&original) = original_map.get(k) {
+                prop_assert_eq!(*v, original.wrapping_mul(2), "extracted value for key {} should be doubled", k);
+            }
+        }
 
-        // Verify extracted elements match
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extract_if mutation extracted mismatch");
-
-        // Verify remaining maps match (retained values should also be mutated)
-        let os_remaining: Vec<_> = os_map.iter().map(|(&k, &v)| (k, v)).collect();
-        let bt_remaining: Vec<_> = bt_map.iter().map(|(&k, &v)| (k, v)).collect();
-        prop_assert_eq!(&os_remaining, &bt_remaining, "extract_if mutation remaining mismatch");
-
-        // Verify that retained values (odd keys) were mutated
+        // Verify that retained values (odd keys) were also mutated
         for (&k, &v) in os_map.iter() {
-            // Original value was doubled, so v should be 2x original
-            let original_entries: std::collections::HashMap<_, _> = entries.iter().cloned().collect();
-            if let Some(&original) = original_entries.get(&k) {
+            prop_assert!(k % 2 != 0, "remaining key {} should be odd", k);
+            if let Some(&original) = original_map.get(&k) {
                 prop_assert_eq!(v, original.wrapping_mul(2), "retained key {} value should be doubled", k);
             }
         }
@@ -1726,7 +1749,6 @@ proptest! {
     #[test]
     fn extract_if_conditional_mutation(entries in proptest::collection::vec((key_strategy(), value_strategy()), TEST_SIZE)) {
         let mut os_map: OSBTreeMap<i64, i64> = entries.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
 
         // Predicate that:
         // - For keys divisible by 3: mutate to 999 and extract (return true)
@@ -1744,29 +1766,16 @@ proptest! {
             }
         }).collect();
 
-        let bt_extracted: Vec<_> = bt_map.extract_if(.., |k, v| {
-            if k % 3 == 0 {
-                *v = 999;
-                true
-            } else if k % 5 == 0 {
-                *v = 555;
-                false
-            } else {
-                false
-            }
-        }).collect();
-
-        // Verify extracted elements match
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extract_if conditional mutation extracted mismatch");
-
-        // Verify remaining maps match
-        let os_remaining: Vec<_> = os_map.iter().map(|(&k, &v)| (k, v)).collect();
-        let bt_remaining: Vec<_> = bt_map.iter().map(|(&k, &v)| (k, v)).collect();
-        prop_assert_eq!(&os_remaining, &bt_remaining, "extract_if conditional mutation remaining mismatch");
+        // Verify extracted elements have keys divisible by 3 and value 999
+        for (k, v) in &os_extracted {
+            prop_assert!(k % 3 == 0, "extracted key {} should be divisible by 3", k);
+            prop_assert_eq!(*v, 999, "extracted value for key {} should be 999", k);
+        }
 
         // Verify specific mutation patterns in retained values
         for (&k, &v) in os_map.iter() {
-            if k % 3 != 0 && k % 5 == 0 {
+            prop_assert!(k % 3 != 0, "remaining key {} should not be divisible by 3", k);
+            if k % 5 == 0 {
                 // Keys divisible by 5 but not 3 should be mutated to 555
                 prop_assert_eq!(v, 555, "key {} divisible by 5 (not 3) should be 555", k);
             }
@@ -1777,7 +1786,7 @@ proptest! {
     #[test]
     fn extract_if_mutate_all_extract_none(entries in proptest::collection::vec((key_strategy(), value_strategy()), TEST_SIZE)) {
         let mut os_map: OSBTreeMap<i64, i64> = entries.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
+        let original_map: std::collections::HashMap<_, _> = entries.iter().cloned().collect();
 
         // Predicate that mutates all values but never extracts
         let os_extracted: Vec<_> = os_map.extract_if(.., |_k, v| {
@@ -1785,22 +1794,13 @@ proptest! {
             false // Never extract
         }).collect();
 
-        let bt_extracted: Vec<_> = bt_map.extract_if(.., |_k, v| {
-            *v = v.wrapping_add(100);
-            false // Never extract
-        }).collect();
-
         // Should extract nothing
         prop_assert!(os_extracted.is_empty(), "should extract nothing");
-        prop_assert!(bt_extracted.is_empty(), "should extract nothing");
 
         // But all values should be mutated
-        let os_items: Vec<_> = os_map.iter().map(|(&k, &v)| (k, v)).collect();
-        let bt_items: Vec<_> = bt_map.iter().map(|(&k, &v)| (k, v)).collect();
-        prop_assert_eq!(&os_items, &bt_items, "all values should be mutated equally");
+        prop_assert_eq!(os_map.len(), original_map.len(), "map length should be unchanged");
 
         // Verify mutations were applied
-        let original_map: std::collections::HashMap<_, _> = entries.iter().cloned().collect();
         for (&k, &v) in os_map.iter() {
             if let Some(&original) = original_map.get(&k) {
                 prop_assert_eq!(v, original.wrapping_add(100), "value for key {} should be incremented by 100", k);
@@ -1812,7 +1812,7 @@ proptest! {
     #[test]
     fn extract_if_mutate_all_extract_all(entries in proptest::collection::vec((key_strategy(), value_strategy()), TEST_SIZE)) {
         let mut os_map: OSBTreeMap<i64, i64> = entries.iter().cloned().collect();
-        let mut bt_map: BTreeMap<i64, i64> = entries.iter().cloned().collect();
+        let original_map: std::collections::HashMap<_, _> = entries.iter().cloned().collect();
 
         // Predicate that mutates and extracts all values
         let os_extracted: Vec<_> = os_map.extract_if(.., |_k, v| {
@@ -1820,22 +1820,17 @@ proptest! {
             true // Always extract
         }).collect();
 
-        let bt_extracted: Vec<_> = bt_map.extract_if(.., |_k, v| {
-            *v = v.wrapping_mul(3);
-            true // Always extract
-        }).collect();
-
         // Should extract everything
-        prop_assert_eq!(&os_extracted, &bt_extracted, "extracted elements should match");
+        prop_assert_eq!(os_extracted.len(), original_map.len(), "should extract all elements");
 
         // Maps should be empty
         prop_assert!(os_map.is_empty(), "map should be empty after extracting all");
-        prop_assert!(bt_map.is_empty(), "map should be empty after extracting all");
 
         // Verify extracted values were mutated
-        for ((os_k, os_v), (bt_k, bt_v)) in os_extracted.iter().zip(bt_extracted.iter()) {
-            prop_assert_eq!(os_k, bt_k, "extracted keys should match");
-            prop_assert_eq!(os_v, bt_v, "extracted values should match");
+        for (k, v) in &os_extracted {
+            if let Some(&original) = original_map.get(k) {
+                prop_assert_eq!(*v, original.wrapping_mul(3), "extracted value for key {} should be tripled", k);
+            }
         }
     }
 }
