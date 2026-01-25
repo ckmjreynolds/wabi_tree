@@ -1512,12 +1512,12 @@ mod tests {
             }
 
             // 4. Validate root size equals len (if root is internal)
-            if let Node::Internal(internal) = self.nodes.get(root)
-                && internal.size().to_usize() != self.len
-            {
-                let root_size = internal.size().to_usize();
-                let len = self.len;
-                errors.push(alloc::format!("Root size mismatch: root.size={root_size}, self.len={len}"));
+            if let Node::Internal(internal) = self.nodes.get(root) {
+                if internal.size().to_usize() != self.len {
+                    let root_size = internal.size().to_usize();
+                    let len = self.len;
+                    errors.push(alloc::format!("Root size mismatch: root.size={root_size}, self.len={len}"));
+                }
             }
 
             assert!(errors.is_empty(), "Tree invariant violations:\n{}", errors.join("\n"));
