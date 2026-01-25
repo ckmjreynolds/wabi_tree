@@ -1,20 +1,35 @@
 [package]
 name    = "wabi_tree"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 
-authors         = ["Chris Reynolds chris@reynolds.guru"]
-description     = "Weight-Balanced Order Statistic Tree written in Rust."
+authors         = ["Chris Reynolds <chris@reynolds.guru>"]
+description     = "Order-statistic B-tree map and set with O(log n) rank operations. Drop-in replacements for BTreeMap/BTreeSet."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/wabi_tree"
-keywords        = ["weight balanced tree", "order statistic tree", "binary search tree"]
-categories      = ["data-structures", "compression"]
-documentation   = "https://docs.rs/lzr"
+keywords        = ["btree", "order-statistic", "no-std", "data-structure", "rank"]
+categories      = ["data-structures", "no-std"]
+documentation   = "https://docs.rs/wabi_tree"
 
 include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
+smallvec = { version = "=1.15.1", default-features = false, features = ["const_generics"] }
+static_assertions = "=1.1.0"
 
 [dev-dependencies]
-pretty_assertions = ">=1.4.1"
+criterion = "=0.8.1"
+proptest = "=1.9.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
+[profile.samply]
+inherits = "release"
+debug = true
+
+[[bench]]
+name = "crud_benchmarks"
+harness = false
