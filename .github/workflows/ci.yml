@@ -17,7 +17,7 @@
       name: Rustfmt
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@stable
           with:
             components: rustfmt
@@ -28,7 +28,7 @@
       name: Clippy
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@stable
           with:
             components: clippy
@@ -42,7 +42,7 @@
       env:
         RUSTDOCFLAGS: -Dwarnings
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@stable
         - uses: Swatinem/rust-cache@v2
         - run: cargo doc --no-deps --all-features
@@ -61,7 +61,7 @@
             - os: ubuntu-latest
               rust: "1.87"
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@master
           with:
             toolchain: ${{ matrix.rust }}
@@ -75,7 +75,7 @@
       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@stable
           with:
             components: llvm-tools-preview
@@ -95,7 +95,7 @@
       name: Security Audit
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
         - uses: rustsec/audit-check@v2
           with:
             token: ${{ secrets.GITHUB_TOKEN }}
@@ -107,7 +107,7 @@
       if: startsWith(github.ref, 'refs/tags/v')
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v4
+        - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@stable
         - uses: Swatinem/rust-cache@v2
         - name: Publish to crates.io
