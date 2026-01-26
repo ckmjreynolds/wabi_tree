@@ -113,30 +113,30 @@
         - name: Publish to crates.io
           run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
 
-  required:
-    name: Required
-    needs: [fmt, clippy, docs, test, coverage, audit]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail if any required job failed
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "fmt=${{ needs.fmt.result }}"
-          echo "clippy=${{ needs.clippy.result }}"
-          echo "docs=${{ needs.docs.result }}"
-          echo "test=${{ needs.test.result }}"
-          echo "coverage=${{ needs.coverage.result }}"
-          echo "audit=${{ needs.audit.result }}"
+    required:
+      name: Required
+      needs: [fmt, clippy, docs, test, coverage, audit]
+      if: always()
+      runs-on: ubuntu-latest
+      steps:
+        - name: Fail if any required job failed
+          shell: bash
+          run: |
+            set -euo pipefail
+            echo "fmt=${{ needs.fmt.result }}"
+            echo "clippy=${{ needs.clippy.result }}"
+            echo "docs=${{ needs.docs.result }}"
+            echo "test=${{ needs.test.result }}"
+            echo "coverage=${{ needs.coverage.result }}"
+            echo "audit=${{ needs.audit.result }}"
 
-          test "${{ needs.fmt.result }}" = "success"
-          test "${{ needs.clippy.result }}" = "success"
-          test "${{ needs.docs.result }}" = "success"
-          test "${{ needs.test.result }}" = "success"
-          test "${{ needs.audit.result }}" = "success"
+            test "${{ needs.fmt.result }}" = "success"
+            test "${{ needs.clippy.result }}" = "success"
+            test "${{ needs.docs.result }}" = "success"
+            test "${{ needs.test.result }}" = "success"
+            test "${{ needs.audit.result }}" = "success"
 
-          # coverage can legitimately be "skipped" on fork PRs
-          if [ "${{ needs.coverage.result }}" = "failure" ] || [ "${{ needs.coverage.result }}" = "cancelled" ]; then
-            exit 1
-          fi
+            # coverage can legitimately be "skipped" on fork PRs
+            if [ "${{ needs.coverage.result }}" = "failure" ] || [ "${{ needs.coverage.result }}" = "cancelled" ]; then
+              exit 1
+            fi
