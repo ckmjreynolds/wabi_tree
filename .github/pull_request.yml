@@ -1,0 +1,24 @@
+## Summary
+
+Describe what this PR changes and why.
+
+## Checklist
+
+- [ ] I ran `cargo fmt --check`
+- [ ] I ran `cargo clippy --all-targets -- -D warnings`
+- [ ] I ran `cargo test --all-targets`
+- [ ] I added/updated tests (if applicable)
+- [ ] I updated docs / examples (if applicable)
+
+## Details
+
+### Motivation / context
+
+### Implementation notes
+
+### Testing notes
+
+### Potential impact
+- [ ] Breaking change
+- [ ] Performance-sensitive change
+- [ ] API change
