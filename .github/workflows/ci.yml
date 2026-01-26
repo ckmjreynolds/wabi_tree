@@ -1,114 +1,142 @@
-name: CI
+  name: CI
 
-on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
+  on:
+    push:
+      branches: [main]
+      tags: ['v*']
+    pull_request:
+      branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+  env:
+    CARGO_TERM_COLOR: always
+    RUSTFLAGS: -Dwarnings
 
-jobs:
-  # Format check
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all --check
+  jobs:
+    # Format check
+    fmt:
+      name: Rustfmt
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: dtolnay/rust-toolchain@stable
+          with:
+            components: rustfmt
+        - run: cargo fmt --all --check
 
-  # Lint check
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features
+    # Lint check
+    clippy:
+      name: Clippy
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: dtolnay/rust-toolchain@stable
+          with:
+            components: clippy
+        - uses: Swatinem/rust-cache@v2
+        - run: cargo clippy --all-targets --all-features
 
-  # Documentation
-  docs:
-    name: Docs
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -Dwarnings
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
+    # Documentation
+    docs:
+      name: Docs
+      runs-on: ubuntu-latest
+      env:
+        RUSTDOCFLAGS: -Dwarnings
+      steps:
+        - uses: actions/checkout@v4
+        - uses: dtolnay/rust-toolchain@stable
+        - uses: Swatinem/rust-cache@v2
+        - run: cargo doc --no-deps --all-features
 
-  # Test matrix across platforms and Rust versions
-  test:
-    name: Test (${{ matrix.os }}, ${{ matrix.rust }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, beta]
-        include:
-          # MSRV check on Linux only
-          - os: ubuntu-latest
-            rust: "1.87"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-features
-      - run: cargo test --all-features
+    # Test matrix across platforms and Rust versions
+    test:
+      name: Test (${{ matrix.os }}, ${{ matrix.rust }})
+      runs-on: ${{ matrix.os }}
+      strategy:
+        fail-fast: false
+        matrix:
+          os: [ubuntu-latest, macos-latest, windows-latest]
+          rust: [stable, beta]
+          include:
+            # MSRV check on Linux only
+            - os: ubuntu-latest
+              rust: "1.87"
+      steps:
+        - uses: actions/checkout@v4
+        - uses: dtolnay/rust-toolchain@master
+          with:
+            toolchain: ${{ matrix.rust }}
+        - uses: Swatinem/rust-cache@v2
+        - run: cargo build --all-features
+        - run: cargo test --all-features
 
-  # Code coverage (Linux only, stable)
-  coverage:
-    name: Coverage
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate coverage
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: true
+    # Code coverage (Linux only, stable)
+    coverage:
+      name: Coverage
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: dtolnay/rust-toolchain@stable
+          with:
+            components: llvm-tools-preview
+        - uses: Swatinem/rust-cache@v2
+        - uses: taiki-e/install-action@cargo-llvm-cov
+        - name: Generate coverage
+          run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        - name: Upload to Codecov
+          uses: codecov/codecov-action@v4
+          with:
+            token: ${{ secrets.CODECOV_TOKEN }}
+            files: lcov.info
+            fail_ci_if_error: true
 
-  # Security audit
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+    # Security audit
+    audit:
+      name: Security Audit
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: rustsec/audit-check@v2
+          with:
+            token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Publish to crates.io on version tags
-  publish:
-    name: Publish
+    # Publish to crates.io on version tags
+    publish:
+      name: Publish
+      needs: [fmt, clippy, docs, test, coverage, audit]
+      if: startsWith(github.ref, 'refs/tags/v')
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: dtolnay/rust-toolchain@stable
+        - uses: Swatinem/rust-cache@v2
+        - name: Publish to crates.io
+          run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+
+  required:
+    name: Required
     needs: [fmt, clippy, docs, test, coverage, audit]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+      - name: Fail if any required job failed
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "fmt=${{ needs.fmt.result }}"
+          echo "clippy=${{ needs.clippy.result }}"
+          echo "docs=${{ needs.docs.result }}"
+          echo "test=${{ needs.test.result }}"
+          echo "coverage=${{ needs.coverage.result }}"
+          echo "audit=${{ needs.audit.result }}"
+
+          test "${{ needs.fmt.result }}" = "success"
+          test "${{ needs.clippy.result }}" = "success"
+          test "${{ needs.docs.result }}" = "success"
+          test "${{ needs.test.result }}" = "success"
+          test "${{ needs.audit.result }}" = "success"
+
+          # coverage can legitimately be "skipped" on fork PRs
+          if [ "${{ needs.coverage.result }}" = "failure" ] || [ "${{ needs.coverage.result }}" = "cancelled" ]; then
+            exit 1
+          fi
