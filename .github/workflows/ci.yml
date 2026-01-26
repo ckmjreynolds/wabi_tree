@@ -82,7 +82,7 @@
         - uses: Swatinem/rust-cache@v2
         - uses: taiki-e/install-action@cargo-llvm-cov
         - name: Generate coverage
-          run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+          run: cargo +nightly llvm-cov --all-features --doctests --branch --lcov --output-path lcov.info
         - name: Upload to Codecov
           uses: codecov/codecov-action@v5
           with:
