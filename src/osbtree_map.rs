@@ -2807,3 +2807,101 @@ where
     F: FnMut(&K, &mut V) -> bool,
 {
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use core::marker::PhantomData;
+
+    #[test]
+    fn internal_guards_handle_empty_first_and_last_leaves() {
+        let mut map: OSBTreeMap<i32, i32> = (0..64).map(|i| (i * 2, i)).collect();
+        let first = map.raw.first_leaf().expect("non-empty map has a first leaf");
+        let last = map.raw.last_leaf().expect("non-empty map has a last leaf");
+
+        let _ = map.raw.node_mut(first).as_leaf_mut().take_all();
+        let _ = map.raw.node_mut(last).as_leaf_mut().take_all();
+
+        assert!(map.first_entry().is_none());
+        assert!(map.last_entry().is_none());
+
+        {
+            let iter = map.iter();
+            assert_eq!(iter.size_hint().1, Some(map.len()));
+        }
+        {
+            let iter_mut = map.iter_mut();
+            assert_eq!(iter_mut.size_hint().1, Some(map.len()));
+        }
+
+        assert_eq!(map.range(..).next(), None);
+        assert_eq!(map.range_mut(..).next(), None);
+    }
+
+    #[test]
+    fn range_iterators_handle_crossed_indices() {
+        let map = OSBTreeMap::from([(1, 10), (2, 20), (3, 30)]);
+        let leaf = map.raw.first_leaf().expect("non-empty map has a leaf");
+
+        {
+            let mut range = Range {
+                tree: &raw const map.raw,
+                front_leaf: Some(leaf),
+                front_index: 2,
+                back_leaf: Some(leaf),
+                back_index: 1,
+                remaining: 0,
+                finished: false,
+                _marker: PhantomData,
+            };
+            assert_eq!(range.next(), None);
+        }
+        {
+            let mut range = Range {
+                tree: &raw const map.raw,
+                front_leaf: Some(leaf),
+                front_index: 1,
+                back_leaf: Some(leaf),
+                back_index: 0,
+                remaining: 0,
+                finished: false,
+                _marker: PhantomData,
+            };
+            assert_eq!(range.next_back(), None);
+        }
+    }
+
+    #[test]
+    fn range_mut_iterators_handle_crossed_indices() {
+        let mut map = OSBTreeMap::from([(1, 10), (2, 20), (3, 30)]);
+        let leaf = map.raw.first_leaf().expect("non-empty map has a leaf");
+
+        {
+            let mut range_mut = RangeMut {
+                tree: &raw mut map.raw,
+                front_leaf: Some(leaf),
+                front_index: 2,
+                back_leaf: Some(leaf),
+                back_index: 1,
+                remaining: 0,
+                finished: false,
+                _marker: PhantomData,
+            };
+            assert_eq!(range_mut.next(), None);
+        }
+        {
+            let mut range_mut = RangeMut {
+                tree: &raw mut map.raw,
+                front_leaf: Some(leaf),
+                front_index: 1,
+                back_leaf: Some(leaf),
+                back_index: 0,
+                remaining: 0,
+                finished: false,
+                _marker: PhantomData,
+            };
+            assert_eq!(range_mut.next_back(), None);
+        }
+    }
+}

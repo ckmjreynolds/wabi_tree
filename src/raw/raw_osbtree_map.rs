@@ -1953,4 +1953,416 @@ mod tests {
             assert_eq!(actual_rank, expected_rank, "Rank of {} should be {}", key, expected_rank);
         }
     }
+
+    #[test]
+    fn accessors_and_pointer_helpers_work() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        tree.insert(1, 10);
+        tree.insert(2, 20);
+
+        let root = tree.root().expect("root exists after inserts");
+        let first_leaf = tree.first_leaf().expect("first leaf exists after inserts");
+        let last_leaf = tree.last_leaf().expect("last leaf exists after inserts");
+        assert_eq!(first_leaf, last_leaf);
+
+        // Access mutable node reference.
+        let leaf_count = tree.node_mut(first_leaf).as_leaf_mut().key_count();
+        assert!(leaf_count > 0);
+
+        // SAFETY: `tree_ptr` points to a valid tree and `first_leaf` is a valid handle.
+        unsafe {
+            let tree_ptr: *const RawOSBTreeMap<i32, i32> = &raw const tree;
+            let node = RawOSBTreeMap::node_ptr(tree_ptr, first_leaf);
+            assert!(node.is_leaf());
+        }
+
+        // Mutate a value through the raw pointer helper.
+        let value_handle = tree.node(first_leaf).as_leaf().value(0);
+        // SAFETY: `tree_ptr` points to a valid tree and `value_handle` is a valid handle.
+        unsafe {
+            let tree_ptr: *mut RawOSBTreeMap<i32, i32> = &raw mut tree;
+            let value = RawOSBTreeMap::value_mut_ptr(tree_ptr, value_handle);
+            *value += 1;
+        }
+        assert_eq!(tree.get(&1), Some(&11));
+
+        // Root accessor is used in several iterators; ensure it is reachable.
+        assert!(tree.node(root).key_count() > 0);
+        tree.validate_invariants();
+    }
+
+    #[test]
+    fn empty_leaf_neighbors_cause_bounds_to_return_none() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        // Use many keys to ensure multiple leaves.
+        for i in 0..4000 {
+            tree.insert(i * 2, i);
+        }
+        tree.validate_invariants();
+
+        // Collect the leaf chain.
+        let mut leaves: Vec<Handle> = Vec::new();
+        let mut current = tree.first_leaf().expect("non-empty tree has a first leaf");
+        loop {
+            leaves.push(current);
+            let leaf = tree.node(current).as_leaf();
+            match leaf.next() {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        assert!(leaves.len() >= 5, "expected multiple leaves");
+
+        let mid_index = leaves.len() / 2;
+        let mid = leaves[mid_index];
+        let prev = leaves[mid_index - 1];
+        let next = leaves[mid_index + 1];
+
+        let mid_key = *tree.node(mid).as_leaf().key(0);
+
+        // Create empty neighbors around `mid` to exercise empty-leaf fallbacks.
+        let _ = tree.node_mut(prev).as_leaf_mut().take_all();
+        let _ = tree.node_mut(mid).as_leaf_mut().take_all();
+        let _ = tree.node_mut(next).as_leaf_mut().take_all();
+
+        // With an empty next leaf, lower/upper bounds should return None here.
+        assert_eq!(tree.lower_bound(&mid_key), None);
+        assert_eq!(tree.upper_bound(&mid_key), None);
+        assert_eq!(tree.upper_bound_inclusive(&mid_key), None);
+        assert_eq!(tree.lower_bound_exclusive(&mid_key), None);
+
+        // Exercise the early return when the leaf is empty but the path is non-empty.
+        let root = tree.root().expect("root exists");
+        let mut synthetic_path: Path = SmallVec::new();
+        synthetic_path.push(PathElement {
+            node: root,
+            child_index: 0,
+        });
+        tree.update_separators_after_remove(mid, &synthetic_path);
+    }
+
+    #[test]
+    fn update_sizes_helpers_cover_leaf_children() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        for i in 0..64 {
+            tree.insert(i, i);
+        }
+        tree.validate_invariants();
+
+        let root = tree.root().expect("root exists");
+        let root_internal = match tree.node(root) {
+            Node::Internal(internal) => internal,
+            Node::Leaf(_) => panic!("expected internal root for this test"),
+        };
+        let first_child = root_internal.child(0);
+        assert!(matches!(tree.node(first_child), Node::Leaf(_)));
+
+        let mut path: Path = SmallVec::new();
+        path.push(PathElement {
+            node: root,
+            child_index: 0,
+        });
+        tree.update_sizes_along_path(&path);
+
+        // Use a synthetic duplicate-root path to exercise the ancestor recompute leaf branch.
+        let mut duplicate_root_path: Path = SmallVec::new();
+        duplicate_root_path.push(PathElement {
+            node: root,
+            child_index: 0,
+        });
+        duplicate_root_path.push(PathElement {
+            node: root,
+            child_index: 0,
+        });
+        tree.update_sizes_after_remove(first_child, &duplicate_root_path);
+
+        tree.validate_invariants();
+    }
+
+    fn make_two_leaf_tree(left_keys: &[i32], right_keys: &[i32]) -> (RawOSBTreeMap<i32, i32>, Handle, Handle, Handle) {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+
+        let left_handle = tree.nodes.alloc(Node::new_leaf());
+        let right_handle = tree.nodes.alloc(Node::new_leaf());
+
+        for &key in left_keys {
+            let value_handle = tree.values.alloc(key * 10);
+            tree.nodes.get_mut(left_handle).as_leaf_mut().push(key, value_handle);
+        }
+        for &key in right_keys {
+            let value_handle = tree.values.alloc(key * 10);
+            tree.nodes.get_mut(right_handle).as_leaf_mut().push(key, value_handle);
+        }
+
+        tree.nodes.get_mut(left_handle).as_leaf_mut().set_next(Some(right_handle));
+        tree.nodes.get_mut(right_handle).as_leaf_mut().set_prev(Some(left_handle));
+
+        let root_handle = tree.nodes.alloc(Node::new_internal());
+        {
+            let root = tree.nodes.get_mut(root_handle).as_internal_mut();
+            root.set_first_child(left_handle, Size::from_usize(left_keys.len()));
+            root.push_child(
+                *left_keys.last().expect("left leaf must be non-empty"),
+                right_handle,
+                Size::from_usize(right_keys.len()),
+            );
+            root.update_size();
+        }
+
+        tree.root = Some(root_handle);
+        tree.first_leaf = Some(left_handle);
+        tree.last_leaf = Some(right_handle);
+        tree.len = left_keys.len() + right_keys.len();
+
+        (tree, root_handle, left_handle, right_handle)
+    }
+
+    #[test]
+    fn take_value_and_empty_first_last_leaf_return_none() {
+        // Cover the take_value accessor using a valid value handle.
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        tree.insert(1, 10);
+        let leaf = tree.first_leaf().expect("leaf exists");
+        let value_handle = tree.node(leaf).as_leaf().value(0);
+        let taken = tree.take_value(value_handle);
+        assert_eq!(taken, 10);
+
+        // Create multiple leaves, then empty the first and last leaves while keeping their handles.
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        for i in 0..400 {
+            tree.insert(i * 2, i);
+        }
+
+        let first = tree.first_leaf().expect("first leaf exists");
+        let last = tree.last_leaf().expect("last leaf exists");
+        let _ = tree.node_mut(first).as_leaf_mut().take_all();
+        let _ = tree.node_mut(last).as_leaf_mut().take_all();
+
+        assert_eq!(tree.first_key_value(), None);
+        assert_eq!(tree.last_key_value(), None);
+    }
+
+    #[test]
+    fn bounds_fallback_to_next_leaf_with_stale_separator() {
+        let (mut tree, root_handle, _left, right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
+
+        // Make the separator far too large so search_child can choose the left leaf incorrectly.
+        tree.nodes.get_mut(root_handle).as_internal_mut().set_key(0, i32::MAX);
+
+        assert_eq!(tree.lower_bound(&7), Some((right, 0)));
+        assert_eq!(tree.upper_bound(&7), Some((right, 0)));
+        assert_eq!(tree.upper_bound(&4), Some((right, 0)));
+    }
+
+    #[test]
+    fn lower_bound_exclusive_uses_previous_leaf_on_boundary() {
+        let (tree, _root, left, _right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
+        tree.validate_invariants();
+
+        // Exact boundary: key is the first key of the right leaf.
+        assert_eq!(tree.lower_bound_exclusive(&6), Some((left, 2)));
+        // Between leaves: not found in right leaf at index 0, so we step to the previous leaf.
+        assert_eq!(tree.lower_bound_exclusive(&5), Some((left, 2)));
+    }
+
+    #[test]
+    fn upper_bound_returns_none_when_next_leaf_is_empty() {
+        let (mut tree, _root, _left, right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
+        let _ = tree.node_mut(right).as_leaf_mut().take_all();
+
+        // Found at the last index with an empty next leaf should return None.
+        assert_eq!(tree.upper_bound(&4), None);
+    }
+
+    #[test]
+    fn lower_bound_exclusive_returns_none_when_prev_leaf_is_empty() {
+        let (mut tree, _root, left, _right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
+        let _ = tree.node_mut(left).as_leaf_mut().take_all();
+
+        // Found at index 0 with an empty previous leaf should return None.
+        assert_eq!(tree.lower_bound_exclusive(&6), None);
+    }
+
+    #[test]
+    fn upper_bound_returns_none_on_last_key_without_next_leaf() {
+        let (tree, _root, _left, _right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
+        assert_eq!(tree.upper_bound(&10), None);
+    }
+
+    #[test]
+    fn lower_bound_exclusive_returns_none_on_first_key_without_prev_leaf() {
+        let (tree, _root, _left, _right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
+        assert_eq!(tree.lower_bound_exclusive(&0), None);
+    }
+
+    #[test]
+    fn remove_from_parent_updates_sizes_when_path_child_is_leaf() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+
+        let leaf_count = crate::raw::node::MIN_INTERNAL_KEYS + 3;
+        let mut leaves: Vec<Handle> = Vec::with_capacity(leaf_count);
+        for i in 0..leaf_count {
+            let handle = tree.nodes.alloc(Node::new_leaf());
+            let key = (i as i32) * 2;
+            let value_handle = tree.values.alloc(key * 10);
+            tree.nodes.get_mut(handle).as_leaf_mut().push(key, value_handle);
+            leaves.push(handle);
+        }
+
+        for (i, &handle) in leaves.iter().enumerate() {
+            let prev = i.checked_sub(1).and_then(|j| leaves.get(j).copied());
+            let next = leaves.get(i + 1).copied();
+            let leaf = tree.nodes.get_mut(handle).as_leaf_mut();
+            leaf.set_prev(prev);
+            leaf.set_next(next);
+        }
+
+        let bottom_handle = tree.nodes.alloc(Node::new_internal());
+        {
+            let bottom = tree.nodes.get_mut(bottom_handle).as_internal_mut();
+            bottom.set_first_child(leaves[0], Size::from_usize(1));
+            for (i, &child) in leaves.iter().enumerate().skip(1) {
+                let sep_key = ((i - 1) as i32) * 2;
+                bottom.push_child(sep_key, child, Size::from_usize(1));
+            }
+            bottom.update_size();
+        }
+
+        let root_handle = tree.nodes.alloc(Node::new_internal());
+        {
+            let bottom_size = tree.nodes.get(bottom_handle).as_internal().size();
+            let root = tree.nodes.get_mut(root_handle).as_internal_mut();
+            root.set_first_child(bottom_handle, bottom_size);
+            root.update_size();
+        }
+
+        tree.root = Some(root_handle);
+        tree.first_leaf = Some(leaves[0]);
+        tree.last_leaf = Some(leaves[leaf_count - 1]);
+        tree.len = leaf_count;
+
+        // Use a duplicate bottom element so the remaining path includes an internal whose child is a leaf.
+        let mut path: Path = SmallVec::new();
+        path.push(PathElement {
+            node: root_handle,
+            child_index: 0,
+        });
+        path.push(PathElement {
+            node: bottom_handle,
+            child_index: 0,
+        });
+        path.push(PathElement {
+            node: bottom_handle,
+            child_index: 0,
+        });
+
+        tree.remove_from_parent_and_propagate(&mut path, 1);
+
+        let bottom_size = tree.nodes.get(bottom_handle).as_internal().size();
+        let root_child_size = tree.nodes.get(root_handle).as_internal().child_size(0);
+        assert_eq!(root_child_size, bottom_size);
+    }
+
+    #[test]
+    fn merge_leaves_updates_first_leaf_when_right_was_first() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+
+        let left_handle = tree.nodes.alloc(Node::new_leaf());
+        let right_handle = tree.nodes.alloc(Node::new_leaf());
+
+        let left_value = tree.values.alloc(10);
+        let right_value = tree.values.alloc(20);
+        tree.nodes.get_mut(left_handle).as_leaf_mut().push(1, left_value);
+        tree.nodes.get_mut(right_handle).as_leaf_mut().push(2, right_value);
+        tree.nodes.get_mut(left_handle).as_leaf_mut().set_next(Some(right_handle));
+        tree.nodes.get_mut(right_handle).as_leaf_mut().set_prev(Some(left_handle));
+
+        let parent_handle = tree.nodes.alloc(Node::new_internal());
+        {
+            let parent = tree.nodes.get_mut(parent_handle).as_internal_mut();
+            parent.set_first_child(left_handle, Size::from_usize(1));
+            parent.push_child(1, right_handle, Size::from_usize(1));
+            parent.update_size();
+        }
+
+        tree.root = Some(parent_handle);
+        // Intentionally point first/last at the right leaf to exercise the update branches.
+        tree.first_leaf = Some(right_handle);
+        tree.last_leaf = Some(right_handle);
+        tree.len = 2;
+
+        let mut path: Path = SmallVec::new();
+        path.push(PathElement {
+            node: parent_handle,
+            child_index: 0,
+        });
+
+        tree.merge_leaves(left_handle, right_handle, &mut path, 0);
+
+        assert_eq!(tree.first_leaf, Some(left_handle));
+        assert_eq!(tree.last_leaf, Some(left_handle));
+        tree.validate_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "get_by_rank: tree size invariant violated")]
+    fn get_by_rank_panics_when_internal_sizes_are_inconsistent() {
+        let (mut tree, root_handle, _left, _right) = make_two_leaf_tree(&[0, 2], &[4, 6]);
+        {
+            let root = tree.nodes.get_mut(root_handle).as_internal_mut();
+            root.set_size(Size::from_usize(5));
+        }
+        tree.len = 5;
+
+        let _ = tree.get_by_rank(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "get_by_rank_mut: tree size invariant violated")]
+    fn get_by_rank_mut_panics_when_internal_sizes_are_inconsistent() {
+        let (mut tree, root_handle, _left, _right) = make_two_leaf_tree(&[0, 2], &[4, 6]);
+        {
+            let root = tree.nodes.get_mut(root_handle).as_internal_mut();
+            root.set_size(Size::from_usize(5));
+        }
+        tree.len = 5;
+
+        let _ = tree.get_by_rank_mut(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected leaf")]
+    fn merge_leaves_panics_on_internal_right() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        tree.insert(1, 1);
+
+        let left_leaf = tree.first_leaf().expect("leaf exists");
+        let internal_handle = tree.nodes.alloc(Node::Internal(InternalNode::new()));
+        let mut path: Path = SmallVec::new();
+        tree.merge_leaves(left_leaf, internal_handle, &mut path, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected internal")]
+    fn merge_internals_panics_on_leaf_right() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+
+        let parent_handle = tree.nodes.alloc(Node::Internal(InternalNode::new()));
+        let left_handle = tree.nodes.alloc(Node::Internal(InternalNode::new()));
+        let right_leaf_handle = tree.nodes.alloc(Node::Leaf(LeafNode::new()));
+
+        {
+            let parent = tree.nodes.get_mut(parent_handle).as_internal_mut();
+            parent.set_first_child(left_handle, Size::from_usize(0));
+            parent.push_child(1, right_leaf_handle, Size::from_usize(0));
+        }
+
+        let mut path: Path = SmallVec::new();
+        path.push(PathElement {
+            node: parent_handle,
+            child_index: 0,
+        });
+
+        tree.merge_internals(left_handle, right_leaf_handle, &mut path, 0);
+    }
 }

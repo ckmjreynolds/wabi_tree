@@ -1968,3 +1968,22 @@ where
     T: Clone + Ord,
 {
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intersection_answer_some_size_hint() {
+        let set: OSBTreeSet<i32> = [1].into_iter().collect();
+        let value = set.first().expect("set contains one value");
+
+        let mut intersection = Intersection {
+            inner: IntersectionInner::Answer(Some(value)),
+        };
+        assert_eq!(intersection.size_hint(), (1, Some(1)));
+        assert_eq!(intersection.next(), Some(&1));
+        assert_eq!(intersection.next(), None);
+    }
+}
