@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use proptest::prelude::*;
+use wabi_tree::osbtree_set;
 use wabi_tree::{OSBTreeSet, Rank};
 
 /// The number of operations to perform in each proptest case.
@@ -1391,4 +1392,124 @@ mod insertion_pattern_tests {
 
         assert!(os_set.is_empty());
     }
+}
+
+// ─── Coverage-focused top-down tests ────────────────────────────────────────
+
+#[test]
+#[allow(clippy::double_ended_iterator_last)]
+fn capacity_default_from_array_extend_refs_and_iter_traits() {
+    let set: OSBTreeSet<i32> = OSBTreeSet::with_capacity(16);
+    assert!(set.is_empty());
+    assert_eq!(set.capacity(), 16);
+
+    let default_set: OSBTreeSet<i32> = Default::default();
+    assert!(default_set.is_empty());
+    let _ = format!("{:?}", default_set);
+
+    let from_arr = OSBTreeSet::from([3, 1, 2]);
+    let items: Vec<_> = from_arr.iter().copied().collect();
+    assert_eq!(items, vec![1, 2, 3]);
+
+    let data = [4, 5, 6];
+    let mut extend_set = OSBTreeSet::new();
+    extend_set.extend(data.iter());
+    assert!(extend_set.contains(&4));
+    assert!(extend_set.contains(&6));
+
+    {
+        let iter = extend_set.iter();
+        assert_eq!(iter.len(), 3);
+        assert_eq!(iter.clone().last(), Some(&6));
+        let _ = format!("{:?}", iter.clone());
+        let collected: Vec<_> = (&extend_set).into_iter().copied().collect();
+        assert_eq!(collected, vec![4, 5, 6]);
+    }
+
+    let empty_iter: osbtree_set::Iter<'_, i32> = Default::default();
+    assert_eq!(empty_iter.len(), 0);
+    let _ = format!("{:?}", empty_iter.clone());
+
+    let empty_into_iter: osbtree_set::IntoIter<i32> = Default::default();
+    let _ = format!("{:?}", empty_into_iter);
+
+    {
+        let range = extend_set.range(4..=5);
+        assert_eq!(range.clone().count(), 2);
+        assert_eq!(range.clone().last(), Some(&5));
+        let _ = format!("{:?}", range.clone());
+    }
+
+    let empty_range: osbtree_set::Range<'_, i32> = Default::default();
+    assert_eq!(empty_range.clone().count(), 0);
+    let _ = format!("{:?}", empty_range);
+}
+
+#[test]
+fn set_operations_algorithm_paths_and_traits() {
+    let empty: OSBTreeSet<i32> = OSBTreeSet::new();
+    let disjoint_a = OSBTreeSet::from([1, 2]);
+    let disjoint_b = OSBTreeSet::from([10, 20]);
+
+    let mut diff_empty = empty.difference(&disjoint_a);
+    assert_eq!(diff_empty.next(), None);
+    assert_eq!(diff_empty.size_hint(), (0, Some(0)));
+    let _ = format!("{:?}", diff_empty.clone());
+
+    let mut diff_disjoint = disjoint_a.difference(&disjoint_b);
+    assert_eq!(diff_disjoint.size_hint().1, Some(2));
+    assert_eq!(diff_disjoint.next(), Some(&1));
+    let _ = format!("{:?}", diff_disjoint.clone());
+
+    let stitch_left = OSBTreeSet::from([1, 2, 3, 4]);
+    let stitch_right = OSBTreeSet::from([3, 4, 5, 6]);
+    let stitch_items: Vec<_> = stitch_left.difference(&stitch_right).copied().collect();
+    assert_eq!(stitch_items, vec![1, 2]);
+    let _ = format!("{:?}", stitch_left.difference(&stitch_right).clone());
+
+    let small = OSBTreeSet::from([1001]);
+    let large: OSBTreeSet<i32> = (0..1000).collect();
+    let mut diff_search = small.difference(&large);
+    assert_eq!(diff_search.size_hint().1, Some(1));
+    assert_eq!(diff_search.next(), Some(&1001));
+    let _ = format!("{:?}", diff_search.clone());
+
+    let empty_intersection = empty.intersection(&disjoint_a);
+    assert_eq!(empty_intersection.clone().next(), None);
+    assert_eq!(empty_intersection.size_hint(), (0, Some(0)));
+    let _ = format!("{:?}", empty_intersection);
+
+    let disjoint_intersection = disjoint_a.intersection(&disjoint_b);
+    assert_eq!(disjoint_intersection.clone().next(), None);
+    assert_eq!(disjoint_intersection.size_hint(), (0, Some(0)));
+    let _ = format!("{:?}", disjoint_intersection);
+
+    let small_overlap = OSBTreeSet::from([500]);
+    let large_overlap: OSBTreeSet<i32> = (0..2000).collect();
+    let mut intersection_search_a = small_overlap.intersection(&large_overlap);
+    assert_eq!(intersection_search_a.next(), Some(&500));
+    let _ = format!("{:?}", intersection_search_a.clone());
+
+    let mut intersection_search_b = large_overlap.intersection(&small_overlap);
+    assert_eq!(intersection_search_b.next(), Some(&500));
+    let _ = format!("{:?}", intersection_search_b.clone());
+
+    let stitch_intersection_items: Vec<_> = stitch_left.intersection(&stitch_right).copied().collect();
+    assert_eq!(stitch_intersection_items, vec![3, 4]);
+
+    let union_left = OSBTreeSet::from([1, 3, 5]);
+    let union_right = OSBTreeSet::from([2, 3, 4]);
+    let union = union_left.union(&union_right);
+    assert_eq!(union.size_hint().0, 3);
+    let _ = format!("{:?}", union.clone());
+    assert_eq!(union_left.union(&union_right).min(), Some(&1));
+
+    let symmetric = union_left.symmetric_difference(&union_right);
+    assert_eq!(symmetric.size_hint().0, 0);
+    let _ = format!("{:?}", symmetric.clone());
+    assert_eq!(union_left.symmetric_difference(&union_right).min(), Some(&1));
+
+    let mut extract_set = OSBTreeSet::from([1, 2, 3]);
+    let extractor = extract_set.extract_if(.., |_| false);
+    let _ = format!("{:?}", extractor);
 }
