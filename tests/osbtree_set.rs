@@ -1433,6 +1433,9 @@ fn capacity_default_from_array_extend_refs_and_iter_traits() {
     let empty_into_iter: osbtree_set::IntoIter<i32> = Default::default();
     let _ = format!("{:?}", empty_into_iter);
 
+    let into_iter_len = OSBTreeSet::from([7, 8, 9]).into_iter();
+    assert_eq!(into_iter_len.len(), 3);
+
     {
         let range = extend_set.range(4..=5);
         assert_eq!(range.clone().count(), 2);
@@ -1461,23 +1464,35 @@ fn set_operations_algorithm_paths_and_traits() {
     assert_eq!(diff_disjoint.next(), Some(&1));
     let _ = format!("{:?}", diff_disjoint.clone());
 
+    let other_empty: OSBTreeSet<i32> = OSBTreeSet::new();
+    let diff_other_empty = disjoint_a.difference(&other_empty);
+    assert_eq!(diff_other_empty.size_hint(), (2, Some(2)));
+    let _ = format!("{:?}", diff_other_empty.clone());
+
     let stitch_left = OSBTreeSet::from([1, 2, 3, 4]);
     let stitch_right = OSBTreeSet::from([3, 4, 5, 6]);
     let stitch_items: Vec<_> = stitch_left.difference(&stitch_right).copied().collect();
     assert_eq!(stitch_items, vec![1, 2]);
     let _ = format!("{:?}", stitch_left.difference(&stitch_right).clone());
 
-    let small = OSBTreeSet::from([1001]);
-    let large: OSBTreeSet<i32> = (0..1000).collect();
-    let mut diff_search = small.difference(&large);
-    assert_eq!(diff_search.size_hint().1, Some(1));
-    assert_eq!(diff_search.next(), Some(&1001));
+    let small_mixed = OSBTreeSet::from([1, 2]);
+    let large_evens: OSBTreeSet<i32> = (0..2000).step_by(2).collect();
+    let diff_search = small_mixed.difference(&large_evens);
+    assert_eq!(diff_search.size_hint(), (0, Some(2)));
     let _ = format!("{:?}", diff_search.clone());
+    let diff_search_items: Vec<_> = small_mixed.difference(&large_evens).copied().collect();
+    assert_eq!(diff_search_items, vec![1]);
+    assert_eq!(small_mixed.difference(&large_evens).min(), Some(&1));
 
     let empty_intersection = empty.intersection(&disjoint_a);
     assert_eq!(empty_intersection.clone().next(), None);
     assert_eq!(empty_intersection.size_hint(), (0, Some(0)));
     let _ = format!("{:?}", empty_intersection);
+
+    let other_empty_intersection = disjoint_a.intersection(&other_empty);
+    assert_eq!(other_empty_intersection.clone().next(), None);
+    assert_eq!(other_empty_intersection.size_hint(), (0, Some(0)));
+    let _ = format!("{:?}", other_empty_intersection);
 
     let disjoint_intersection = disjoint_a.intersection(&disjoint_b);
     assert_eq!(disjoint_intersection.clone().next(), None);
@@ -1494,8 +1509,18 @@ fn set_operations_algorithm_paths_and_traits() {
     assert_eq!(intersection_search_b.next(), Some(&500));
     let _ = format!("{:?}", intersection_search_b.clone());
 
+    let stitch_intersection = stitch_left.intersection(&stitch_right);
+    let _ = format!("{:?}", stitch_intersection.clone());
     let stitch_intersection_items: Vec<_> = stitch_left.intersection(&stitch_right).copied().collect();
     assert_eq!(stitch_intersection_items, vec![3, 4]);
+    assert_eq!(stitch_left.intersection(&stitch_right).min(), Some(&3));
+
+    let small_odds = OSBTreeSet::from([1, 3, 5, 7, 9]);
+    let intersection_search = small_odds.intersection(&large_evens);
+    assert_eq!(intersection_search.size_hint(), (0, Some(5)));
+    let _ = format!("{:?}", intersection_search.clone());
+    assert_eq!(small_odds.intersection(&large_evens).next(), None);
+    assert_eq!(small_odds.intersection(&large_evens).min(), None);
 
     let union_left = OSBTreeSet::from([1, 3, 5]);
     let union_right = OSBTreeSet::from([2, 3, 4]);

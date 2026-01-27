@@ -509,3 +509,102 @@ impl<K> LeafNode<K> {
         self.next = right.next;
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    fn h(i: usize) -> Handle {
+        Handle::from_index(i)
+    }
+
+    #[test]
+    fn node_constructors_and_predicates() {
+        let leaf_node: Node<i32> = Node::new_leaf();
+        assert!(leaf_node.is_leaf());
+        assert!(!leaf_node.is_internal());
+        assert_eq!(leaf_node.key_count(), 0);
+
+        let internal_node: Node<i32> = Node::new_internal();
+        assert!(internal_node.is_internal());
+        assert!(!internal_node.is_leaf());
+        assert_eq!(internal_node.key_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected leaf node")]
+    fn as_leaf_panics_on_internal() {
+        let internal_node: Node<i32> = Node::new_internal();
+        let _ = internal_node.as_leaf();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected internal node")]
+    fn as_internal_panics_on_leaf() {
+        let leaf_node: Node<i32> = Node::new_leaf();
+        let _ = leaf_node.as_internal();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected leaf node")]
+    fn as_leaf_mut_panics_on_internal() {
+        let mut internal_node: Node<i32> = Node::new_internal();
+        let _ = internal_node.as_leaf_mut();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected internal node")]
+    fn as_internal_mut_panics_on_leaf() {
+        let mut leaf_node: Node<i32> = Node::new_leaf();
+        let _ = leaf_node.as_internal_mut();
+    }
+
+    #[test]
+    fn internal_accessors_and_empty_pops() {
+        let mut internal: InternalNode<i32> = InternalNode::new();
+        assert!(internal.has_room());
+        assert!(internal.is_at_minimum());
+        assert!(!internal.can_lend());
+        assert_eq!(internal.pop_child(), None);
+        assert_eq!(internal.pop_child_front(), None);
+
+        internal.set_first_child(h(0), Size::from_usize(1));
+        internal.push_child(10, h(1), Size::from_usize(2));
+        internal.update_size();
+
+        assert_eq!(internal.child_count(), 2);
+        assert_eq!(internal.keys(), &[10]);
+        assert_eq!(internal.children(), &[h(0), h(1)]);
+        assert_eq!(internal.child_sizes().len(), 2);
+        assert_eq!(internal.child_size(0).to_usize(), 1);
+
+        // Exercise the mutable children accessor.
+        let children_mut = internal.children_mut();
+        assert_eq!(children_mut.len(), 2);
+        children_mut[0] = h(2);
+        assert_eq!(internal.child(0), h(2));
+    }
+
+    #[test]
+    fn leaf_accessors_and_empty_pops() {
+        let mut leaf: LeafNode<i32> = LeafNode::new();
+        assert!(leaf.has_room());
+        assert!(leaf.is_at_minimum());
+        assert!(!leaf.can_lend());
+        assert_eq!(leaf.pop(), None);
+        assert_eq!(leaf.pop_front(), None);
+        assert_eq!(leaf.keys(), &[]);
+        assert_eq!(leaf.values(), &[]);
+
+        leaf.push(1, h(3));
+        leaf.push(2, h(4));
+        leaf.push_front(0, h(5));
+        assert_eq!(leaf.keys(), &[0, 1, 2]);
+        assert_eq!(leaf.values(), &[h(5), h(3), h(4)]);
+        assert_eq!(leaf.last_key(), Some(&2));
+
+        leaf.set_value(1, h(6));
+        assert_eq!(leaf.value(1), h(6));
+    }
+}

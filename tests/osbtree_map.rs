@@ -2521,6 +2521,11 @@ fn range_edge_cases() {
     assert_eq!(map.range(..=5).next(), None);
     assert_eq!(map.range(..5).next(), None);
     assert_eq!(map.range(25..).next(), None);
+    {
+        use core::ops::Bound::{Excluded, Unbounded};
+        let mut excluded_start = map.range((Excluded(25), Unbounded));
+        assert_eq!(excluded_start.next(), None);
+    }
 
     let sparse = OSBTreeMap::from([(10, 1), (20, 2)]);
     let mut range = sparse.range(15..=15);
@@ -2538,6 +2543,25 @@ fn range_mut_edge_cases() {
     let mut map = OSBTreeMap::from([(10, 1), (20, 2)]);
     assert_eq!(map.range_mut(..=5).next(), None);
     assert_eq!(map.range_mut(25..).next(), None);
+    {
+        use core::ops::Bound::{Excluded, Unbounded};
+        assert_eq!(map.range_mut((Excluded(25), Unbounded)).next(), None);
+        assert_eq!(map.range_mut((Unbounded, Excluded(5))).next(), None);
+    }
+
+    let mut map_excluded = OSBTreeMap::from([(10, 1), (20, 2), (30, 3)]);
+    {
+        use core::ops::Bound::{Excluded, Unbounded};
+        let mut range_mut = map_excluded.range_mut((Excluded(10), Unbounded));
+        let first = range_mut.next().map(|(k, v)| (*k, *v));
+        assert_eq!(first, Some((20, 2)));
+    }
+    {
+        use core::ops::Bound::{Excluded, Unbounded};
+        let mut range_mut = map_excluded.range_mut((Unbounded, Excluded(30)));
+        let last = range_mut.next_back().map(|(k, v)| (*k, *v));
+        assert_eq!(last, Some((20, 2)));
+    }
 
     let mut sparse = OSBTreeMap::from([(10, 1), (20, 2)]);
     {
@@ -2576,6 +2600,13 @@ fn iterator_trait_impls() {
         assert_eq!(values.len(), 3);
         assert_eq!(map.values().last(), Some(&31));
         let _ = format!("{:?}", values.clone());
+
+        let mut values_mut = map.values_mut();
+        assert_eq!(values_mut.size_hint(), (3, Some(3)));
+        let back_value = values_mut.next_back().map(|v| *v);
+        assert_eq!(back_value, Some(31));
+        let last_value = map.values_mut().last().map(|v| *v);
+        assert_eq!(last_value, Some(31));
 
         let range = map.range(1..=2);
         assert_eq!(range.len(), 2);
@@ -2643,4 +2674,70 @@ fn iterator_trait_impls() {
     let mut extract_map = map.clone();
     let extractor = extract_map.extract_if(.., |_, _| false);
     let _ = format!("{:?}", extractor);
+}
+
+#[test]
+fn empty_clone_and_into_iter_variants() {
+    let empty: OSBTreeMap<i32, i32> = OSBTreeMap::new();
+    let cloned = empty.clone();
+    assert!(cloned.is_empty());
+
+    let mut into_iter = OSBTreeMap::<i32, i32>::new().into_iter();
+    assert_eq!(into_iter.next(), None);
+
+    let mut into_keys = OSBTreeMap::<i32, i32>::new().into_keys();
+    assert_eq!(into_keys.next(), None);
+
+    let mut into_values = OSBTreeMap::<i32, i32>::new().into_values();
+    assert_eq!(into_values.next(), None);
+}
+
+#[test]
+fn boundary_stress_around_leaf_edges() {
+    use core::ops::Bound::{Excluded, Unbounded};
+
+    // Use many even keys to guarantee gaps between adjacent keys.
+    let mut map: OSBTreeMap<i32, i32> = (0..4000).map(|i| (i * 2, i)).collect();
+    assert!(map.len() > 512);
+
+    // Stress start/end bounds around many adjacent key gaps.
+    for rank in 0..(map.len() - 1) {
+        let k1 = *map.get_by_rank(rank).expect("rank in bounds").0;
+        let k2 = *map.get_by_rank(rank + 1).expect("rank+1 in bounds").0;
+        if k2 - k1 <= 1 {
+            continue;
+        }
+        let mid = k1 + 1;
+
+        // Lower-bound style: start at a non-existent key between two keys.
+        let _ = map.range(mid..).next();
+
+        // Upper-bound style: exclude an existing key.
+        let _ = map.range((Excluded(k1), Unbounded)).next();
+
+        // RangeMut variants exercise the same raw bound helpers.
+        {
+            let _ = map.range_mut(mid..).next();
+        }
+        {
+            let _ = map.range_mut((Excluded(k1), Unbounded)).next();
+        }
+    }
+}
+
+#[test]
+fn empty_iterators_and_ranges_are_well_formed() {
+    let mut map: OSBTreeMap<i32, i32> = OSBTreeMap::new();
+
+    {
+        let iter = map.iter();
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+    {
+        let iter_mut = map.iter_mut();
+        assert_eq!(iter_mut.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(map.range(..).next(), None);
+    assert_eq!(map.range_mut(..).next(), None);
 }
