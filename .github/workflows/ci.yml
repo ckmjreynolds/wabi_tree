@@ -84,7 +84,7 @@
         - name: Generate coverage
           run: cargo +nightly llvm-cov --all-features --doctests --branch --lcov --output-path lcov.info
         - name: Upload to Codecov
-          uses: codecov/codecov-action@v5
+          uses: codecov/codecov-action@v6
           with:
             token: ${{ secrets.CODECOV_TOKEN }}
             files: lcov.info
