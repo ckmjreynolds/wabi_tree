@@ -16,7 +16,7 @@ documentation   = "https://docs.rs/wabi_tree"
 include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
-smallvec = { version = "=1.15.1", default-features = false, features = ["const_generics"] }
+smallvec = { version = "=1.15.2", default-features = false, features = ["const_generics"] }
 static_assertions = "=1.1.0"
 
 [dev-dependencies]
