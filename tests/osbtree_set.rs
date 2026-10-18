@@ -1402,6 +1402,7 @@ fn capacity_default_from_array_extend_refs_and_iter_traits() {
     let set: OSBTreeSet<i32> = OSBTreeSet::with_capacity(16);
     assert!(set.is_empty());
     assert_eq!(set.capacity(), 16);
+    assert_eq!(set.clone().capacity(), 16);
 
     let default_set: OSBTreeSet<i32> = Default::default();
     assert!(default_set.is_empty());

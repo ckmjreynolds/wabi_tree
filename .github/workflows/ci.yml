@@ -7,6 +7,11 @@
     pull_request:
       branches: [main]
 
+  # Least privilege for GITHUB_TOKEN; jobs that need more (audit) widen it themselves.
+  # Publishing and Codecov use their own tokens.
+  permissions:
+    contents: read
+
   env:
     CARGO_TERM_COLOR: always
     RUSTFLAGS: -Dwarnings
@@ -68,21 +73,25 @@
         - uses: Swatinem/rust-cache@v2
         - run: cargo build --all-features
         - run: cargo test --all-features
+        # Release builds drop debug assertions, so run the suite there too (Linux stable only).
+        - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+          run: cargo test --all-features --release
 
-    # Code coverage (Linux only, stable)
+    # Code coverage (Linux only, nightly for branch coverage)
     coverage:
       name: Coverage
       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
       runs-on: ubuntu-latest
       steps:
         - uses: actions/checkout@v7
-        - uses: dtolnay/rust-toolchain@stable
+        - uses: dtolnay/rust-toolchain@master
           with:
+            toolchain: nightly-2026-10-17
             components: llvm-tools-preview
         - uses: Swatinem/rust-cache@v2
         - uses: taiki-e/install-action@cargo-llvm-cov
         - name: Generate coverage
-          run: cargo +nightly llvm-cov --all-features --doctests --branch --lcov --output-path lcov.info
+          run: cargo +nightly-2026-10-17 llvm-cov --all-features --doctests --branch --lcov --output-path lcov.info
         - name: Upload to Codecov
           uses: codecov/codecov-action@v7
           with:
@@ -90,10 +99,34 @@
             files: lcov.info
             fail_ci_if_error: true
 
+    # Undefined-behavior checks of the unsafe code paths (pinned nightly for reproducibility)
+    miri:
+      name: Miri
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v7
+        - uses: dtolnay/rust-toolchain@master
+          with:
+            toolchain: nightly-2026-10-17
+            components: miri, rust-src
+        - uses: Swatinem/rust-cache@v2
+        - run: cargo +nightly-2026-10-17 miri setup
+        - name: Miri (Stacked Borrows)
+          run: cargo +nightly-2026-10-17 miri test --test miri
+        - name: Miri (Tree Borrows)
+          run: cargo +nightly-2026-10-17 miri test --test miri
+          env:
+            MIRIFLAGS: -Zmiri-tree-borrows
+
     # Security audit
     audit:
       name: Security Audit
       runs-on: ubuntu-latest
+      # audit-check reports via a check run and opens issues for new advisories.
+      permissions:
+        contents: read
+        checks: write
+        issues: write
       steps:
         - uses: actions/checkout@v7
         - uses: rustsec/audit-check@v2
@@ -103,7 +136,7 @@
     # Publish to crates.io on version tags
     publish:
       name: Publish
-      needs: [fmt, clippy, docs, test, coverage, audit]
+      needs: [fmt, clippy, docs, test, miri, coverage, audit]
       if: startsWith(github.ref, 'refs/tags/v')
       runs-on: ubuntu-latest
       steps:
@@ -115,7 +148,7 @@
 
     required:
       name: Required
-      needs: [fmt, clippy, docs, test, coverage, audit]
+      needs: [fmt, clippy, docs, test, miri, coverage, audit]
       if: always()
       runs-on: ubuntu-latest
       steps:
@@ -127,6 +160,7 @@
             echo "clippy=${{ needs.clippy.result }}"
             echo "docs=${{ needs.docs.result }}"
             echo "test=${{ needs.test.result }}"
+            echo "miri=${{ needs.miri.result }}"
             echo "coverage=${{ needs.coverage.result }}"
             echo "audit=${{ needs.audit.result }}"
 
@@ -134,6 +168,7 @@
             test "${{ needs.clippy.result }}" = "success"
             test "${{ needs.docs.result }}" = "success"
             test "${{ needs.test.result }}" = "success"
+            test "${{ needs.miri.result }}" = "success"
             test "${{ needs.audit.result }}" = "success"
 
             # coverage can legitimately be "skipped" on fork PRs

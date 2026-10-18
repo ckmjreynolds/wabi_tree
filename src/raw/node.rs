@@ -16,14 +16,15 @@ pub(crate) const MAX_KEYS: usize = MAX_CHILDREN - 1;
 pub(crate) const MIN_INTERNAL_KEYS: usize = MIN_CHILDREN - 1;
 pub(crate) const MIN_LEAF_KEYS: usize = MAX_KEYS.div_ceil(2);
 
-#[allow(private_interfaces)]
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub(crate) enum Node<K> {
     Internal(InternalNode<K>),
     Leaf(LeafNode<K>),
 }
 
 // B+Tree: Internal nodes store separator keys and child handles.
+#[derive(Clone)]
 pub(crate) struct InternalNode<K> {
     // The number of key/value pairs in the subtree rooted at this node.
     size: Size,
@@ -36,6 +37,7 @@ pub(crate) struct InternalNode<K> {
 }
 
 // B+Tree: Leaf nodes store keys and value handles.
+#[derive(Clone)]
 pub(crate) struct LeafNode<K> {
     prev: Option<Handle>,
     next: Option<Handle>,
@@ -54,21 +56,25 @@ pub(crate) enum SearchResult {
 
 impl<K> Node<K> {
     /// Creates a new empty leaf node.
+    #[cfg(test)]
     pub(crate) fn new_leaf() -> Self {
         Node::Leaf(LeafNode::new())
     }
 
     /// Creates a new internal node with given children.
+    #[cfg(test)]
     pub(crate) fn new_internal() -> Self {
         Node::Internal(InternalNode::new())
     }
 
     /// Returns true if this is a leaf node.
+    #[cfg(test)]
     pub(crate) fn is_leaf(&self) -> bool {
         matches!(self, Node::Leaf(_))
     }
 
     /// Returns true if this is an internal node.
+    #[cfg(test)]
     pub(crate) fn is_internal(&self) -> bool {
         matches!(self, Node::Internal(_))
     }
@@ -106,10 +112,18 @@ impl<K> Node<K> {
     }
 
     /// Returns the number of keys in this node.
+    #[cfg(test)]
     pub(crate) fn key_count(&self) -> usize {
         match self {
             Node::Internal(internal) => internal.key_count(),
             Node::Leaf(leaf) => leaf.key_count(),
+        }
+    }
+    /// Returns the number of key/value pairs in the subtree rooted at this node.
+    pub(crate) fn subtree_size(&self) -> Size {
+        match self {
+            Node::Internal(internal) => internal.size(),
+            Node::Leaf(leaf) => Size::from_usize(leaf.key_count()),
         }
     }
 }
@@ -136,6 +150,7 @@ impl<K> InternalNode<K> {
     }
 
     /// Returns true if this node has room for more keys.
+    #[cfg(test)]
     pub(crate) fn has_room(&self) -> bool {
         self.keys.len() < MAX_KEYS
     }
@@ -173,6 +188,7 @@ impl<K> InternalNode<K> {
     }
 
     /// Returns all keys.
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> &[K] {
         &self.keys
     }
@@ -184,11 +200,13 @@ impl<K> InternalNode<K> {
     }
 
     /// Returns all children.
+    #[cfg(test)]
     pub(crate) fn children(&self) -> &[Handle] {
         &self.children
     }
 
     /// Returns all children mutably.
+    #[cfg(test)]
     pub(crate) fn children_mut(&mut self) -> &mut SmallVec<[Handle; MAX_CHILDREN + 1]> {
         &mut self.children
     }
@@ -273,14 +291,10 @@ impl<K> InternalNode<K> {
 
     /// Pops the last key and child.
     pub(crate) fn pop_child(&mut self) -> Option<(K, Handle, Size)> {
-        if self.keys.is_empty() {
-            None
-        } else {
-            let key = self.keys.pop().unwrap();
-            let child = self.children.pop().unwrap();
-            let size = self.child_sizes.pop().unwrap();
-            Some((key, child, size))
-        }
+        let key = self.keys.pop()?;
+        let child = self.children.pop().unwrap();
+        let size = self.child_sizes.pop().unwrap();
+        Some((key, child, size))
     }
 
     /// Pops the first key and child (keeping the first child in place conceptually).
@@ -347,6 +361,7 @@ impl<K> LeafNode<K> {
     }
 
     /// Returns true if this node has room for more keys.
+    #[cfg(test)]
     pub(crate) fn has_room(&self) -> bool {
         self.keys.len() < MAX_KEYS
     }
@@ -388,6 +403,7 @@ impl<K> LeafNode<K> {
     }
 
     /// Returns all keys.
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> &[K] {
         &self.keys
     }
@@ -399,6 +415,7 @@ impl<K> LeafNode<K> {
     }
 
     /// Returns all value handles.
+    #[cfg(test)]
     pub(crate) fn values(&self) -> &[Handle] {
         &self.values
     }
@@ -436,6 +453,7 @@ impl<K> LeafNode<K> {
     }
 
     /// Sets the value handle at the given index.
+    #[cfg(test)]
     pub(crate) fn set_value(&mut self, index: usize, value: Handle) {
         self.values[index] = value;
     }
@@ -454,13 +472,9 @@ impl<K> LeafNode<K> {
 
     /// Pops the last key and value.
     pub(crate) fn pop(&mut self) -> Option<(K, Handle)> {
-        if self.keys.is_empty() {
-            None
-        } else {
-            let key = self.keys.pop().unwrap();
-            let value = self.values.pop().unwrap();
-            Some((key, value))
-        }
+        let key = self.keys.pop()?;
+        let value = self.values.pop().unwrap();
+        Some((key, value))
     }
 
     /// Pops the first key and value.
@@ -489,15 +503,16 @@ impl<K> LeafNode<K> {
     {
         let mid = self.keys.len() / 2;
 
+        // The split key is the last key in the left node (for B+tree separator). Clone it before
+        // moving anything, so a panicking `K::clone` leaves this leaf intact.
+        let split_key = self.keys[mid - 1].clone();
+
         // Create the right node
         let mut right = LeafNode::new();
 
         // Move keys[mid..] and values[mid..] to right node
         right.keys = self.keys.drain(mid..).collect();
         right.values = self.values.drain(mid..).collect();
-
-        // The split key is the last key in the left node (for B+tree separator)
-        let split_key = self.keys.last().unwrap().clone();
 
         (split_key, right)
     }

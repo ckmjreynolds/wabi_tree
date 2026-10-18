@@ -1,5 +1,3 @@
-use core::num::NonZero;
-
 use super::handle::Handle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,11 +25,9 @@ impl Size {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use static_assertions::assert_eq_size;
-
     // Verify our assumptions about `Size` and the niche optimization.
-    assert_eq_size!(Size, Option<Size>);
-    assert_eq_size!(Size, Handle);
+    const _: () = assert!(size_of::<Size>() == size_of::<Option<Size>>());
+    const _: () = assert!(size_of::<Size>() == size_of::<Handle>());
 
     #[test]
     #[should_panic(expected = "`Size::from_usize()` - `size` > `Size::MAX`!")]

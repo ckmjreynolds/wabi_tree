@@ -2452,6 +2452,7 @@ fn capacity_default_from_array_and_extend_refs() {
     let map: OSBTreeMap<i32, i32> = OSBTreeMap::with_capacity(8);
     assert!(map.is_empty());
     assert_eq!(map.capacity(), 8);
+    assert_eq!(map.clone().capacity(), 8);
 
     let default_map: OSBTreeMap<i32, i32> = Default::default();
     assert!(default_map.is_empty());
@@ -2740,4 +2741,111 @@ fn empty_iterators_and_ranges_are_well_formed() {
 
     assert_eq!(map.range(..).next(), None);
     assert_eq!(map.range_mut(..).next(), None);
+}
+
+// ─── Panic safety ───────────────────────────────────────────────────────────
+
+std::thread_local! {
+    static CLONE_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A key whose `Clone` panics while `CLONE_PANICS` is set.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PanickyKey(u32);
+
+impl Clone for PanickyKey {
+    fn clone(&self) -> Self {
+        assert!(!CLONE_PANICS.with(std::cell::Cell::get), "PanickyKey::clone");
+        PanickyKey(self.0)
+    }
+}
+
+/// Runs `f` with `PanickyKey::clone` panicking, and returns whether `f` panicked.
+fn with_panicking_clone(f: impl FnOnce()) -> bool {
+    CLONE_PANICS.with(|p| p.set(true));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+    CLONE_PANICS.with(|p| p.set(false));
+    panicked
+}
+
+fn assert_matches_model(map: &OSBTreeMap<PanickyKey, u32>, model: &BTreeMap<u32, u32>) {
+    assert_eq!(map.len(), model.len());
+    assert_eq!(map.iter().len(), model.len());
+    assert!(map.iter().map(|(k, v)| (k.0, *v)).eq(model.iter().map(|(&k, &v)| (k, v))));
+    assert!(map.iter().rev().map(|(k, v)| (k.0, *v)).eq(model.iter().rev().map(|(&k, &v)| (k, v))));
+    for (rank, (&k, &v)) in model.iter().enumerate().step_by(37) {
+        assert_eq!(map.get(&PanickyKey(k)), Some(&v));
+        assert_eq!(map.rank_of(&PanickyKey(k)), Some(rank));
+        assert_eq!(map.get_by_rank(rank).map(|(k, v)| (k.0, *v)), Some((k, v)));
+    }
+}
+
+#[test]
+fn panicking_key_clone_during_leaf_split_loses_nothing() {
+    let mut map = OSBTreeMap::new();
+    let mut model = BTreeMap::new();
+    // One full leaf; the next insert has to split it, which clones a key.
+    for i in 0..127 {
+        map.insert(PanickyKey(i * 2), i);
+        model.insert(i * 2, i);
+    }
+    assert!(with_panicking_clone(|| {
+        map.insert(PanickyKey(1_000), 1_000);
+    }));
+    // The insert itself completed before the split panicked.
+    model.insert(1_000, 1_000);
+    assert_matches_model(&map, &model);
+
+    // The tree stays fully usable afterwards.
+    for i in 0..500 {
+        map.insert(PanickyKey(i * 2 + 1), i);
+        model.insert(i * 2 + 1, i);
+    }
+    for i in (0..1_000).step_by(3) {
+        assert_eq!(map.remove(&PanickyKey(i)), model.remove(&i));
+    }
+    assert_matches_model(&map, &model);
+}
+
+#[test]
+fn panicking_key_clone_during_inserts_and_removes_keeps_tree_consistent() {
+    let mut map = OSBTreeMap::new();
+    let mut model = BTreeMap::new();
+    for i in 0..5_000 {
+        map.insert(PanickyKey(i * 3), i);
+        model.insert(i * 3, i);
+    }
+
+    // Inserts that split and removes that rebalance or update separators all clone keys.
+    // Both operations finish their change before cloning, so the model applies either way.
+    let mut panics = 0;
+    for i in 0..3_000u32 {
+        let key = (i * 7_919) % 16_000;
+        if i % 2 == 0 {
+            panics += u32::from(with_panicking_clone(|| {
+                map.insert(PanickyKey(key), i);
+            }));
+            model.insert(key, i);
+        } else {
+            panics += u32::from(with_panicking_clone(|| {
+                map.remove(&PanickyKey(key));
+            }));
+            model.remove(&key);
+        }
+        assert_eq!(map.len(), model.len());
+    }
+    assert!(panics > 0, "the test should exercise at least one panicking clone");
+    assert_matches_model(&map, &model);
+
+    // Normal operation afterwards, including clearing the tree out completely.
+    for &k in model.clone().keys() {
+        if k % 2 == 0 {
+            assert_eq!(map.remove(&PanickyKey(k)), model.remove(&k));
+        }
+    }
+    assert_matches_model(&map, &model);
+    while let Some((k, v)) = map.pop_first() {
+        assert_eq!(model.pop_first(), Some((k.0, v)));
+    }
+    assert!(model.is_empty());
 }

@@ -2,7 +2,6 @@ use alloc::vec::Vec;
 
 use super::handle::Handle;
 
-#[derive(Clone)]
 pub(crate) struct Arena<T> {
     slots: Vec<Option<T>>,
     free: Vec<Handle>,
@@ -27,10 +26,18 @@ impl<T> Arena<T> {
         self.slots.capacity()
     }
 
+    #[cfg(test)]
     pub(crate) const fn len(&self) -> usize {
         self.slots.len().saturating_sub(self.free.len())
     }
 
+    /// Returns the number of slots, live or free.
+    #[cfg(test)]
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[cfg(test)]
     pub(crate) const fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -69,6 +76,27 @@ impl<T> Arena<T> {
         // SAFETY: Caller guarantees ptr is valid. We only read from the slots field.
         // The explicit reference is intentional to index into the Vec.
         unsafe { (&(*ptr).slots)[handle.to_index()].as_ref().expect("`Arena::get_ptr()` - `handle` is invalid!") }
+    }
+
+    /// Returns a mutable reference to an element by handle from a raw pointer.
+    ///
+    /// Unlike [`Self::get_mut`], this never creates a reference to the arena or to the whole
+    /// slot buffer, only to the one slot. References previously returned for *other* slots
+    /// therefore stay valid, which mutable iterators rely on.
+    ///
+    /// # Safety
+    /// - `ptr` must point to a valid, allocated `Arena<T>`.
+    /// - No other reference to the slot at `handle` may be live for `'a`.
+    #[inline]
+    pub(crate) unsafe fn get_mut_ptr<'a>(ptr: *mut Self, handle: Handle) -> &'a mut T {
+        let index = handle.to_index();
+        // SAFETY: Caller guarantees ptr is valid. `Vec::as_mut_ptr` does not materialize a
+        // reference to the buffer, and `index` is bounds-checked before the offset.
+        unsafe {
+            let slots = &raw mut (*ptr).slots;
+            assert!(index < (*slots).len(), "`Arena::get_mut_ptr()` - `handle` is out of bounds!");
+            (*(*slots).as_mut_ptr().add(index)).as_mut().expect("`Arena::get_mut_ptr()` - `handle` is invalid!")
+        }
     }
 
     #[inline]

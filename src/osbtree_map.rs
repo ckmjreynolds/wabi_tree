@@ -6,7 +6,7 @@ use core::iter::FusedIterator;
 use core::marker::PhantomData;
 use core::ops::{Bound, Index, RangeBounds};
 
-use crate::raw::{Handle, LeafNode, Node, RawOSBTreeMap};
+use crate::raw::{Handle, RangeCursor, RawOSBTreeMap};
 
 mod capacity;
 mod entry;
@@ -478,18 +478,15 @@ unsafe impl<K: Send, V: Send> Send for RangeMut<'_, K, V> {}
 /// ```
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ExtractIf<'a, K, V, R, F> {
-    tree: &'a mut RawOSBTreeMap<K, V>,
-    /// Keys to potentially extract (collected upfront)
-    keys: alloc::vec::Vec<K>,
-    /// Current index in keys
-    index: usize,
     pred: F,
-    _marker: PhantomData<R>,
+    inner: ExtractIfInner<'a, K, V, R>,
 }
 
 pub(crate) struct ExtractIfInner<'a, K, V, R> {
     tree: &'a mut RawOSBTreeMap<K, V>,
+    /// Keys to potentially extract (collected upfront)
     keys: alloc::vec::Vec<K>,
+    /// Current index in keys
     index: usize,
     _marker: PhantomData<R>,
 }
@@ -508,8 +505,8 @@ impl<K: Clone + Ord, V, R: RangeBounds<K>> ExtractIfInner<'_, K, V, R> {
             let should_remove = self.tree.get_mut(key).is_some_and(|value| pred(key, value));
             if should_remove {
                 // Remove and return
-                if let Some((k, v)) = self.tree.remove_entry(key) {
-                    return Some((k, v));
+                if let Some(entry) = self.tree.remove_entry(key) {
+                    return Some(entry);
                 }
             }
         }
@@ -712,16 +709,12 @@ impl<K, V> OSBTreeMap<K, V> {
     where
         K: Ord + Clone,
     {
-        let first_leaf = self.raw.first_leaf()?;
-        let leaf = self.raw.node(first_leaf).as_leaf();
-        if leaf.key_count() == 0 {
-            return None;
-        }
-        let key = leaf.key(0).clone();
+        let (leaf_handle, index) = self.raw.first_position()?;
+        let key = self.raw.node(leaf_handle).as_leaf().key(index).clone();
         Some(OccupiedEntry {
             key,
-            leaf_handle: first_leaf,
-            index: 0,
+            leaf_handle,
+            index,
             tree: &mut self.raw,
         })
     }
@@ -808,16 +801,11 @@ impl<K, V> OSBTreeMap<K, V> {
     where
         K: Ord + Clone,
     {
-        let last_leaf = self.raw.last_leaf()?;
-        let leaf = self.raw.node(last_leaf).as_leaf();
-        if leaf.key_count() == 0 {
-            return None;
-        }
-        let index = leaf.key_count() - 1;
-        let key = leaf.key(index).clone();
+        let (leaf_handle, index) = self.raw.last_position()?;
+        let key = self.raw.node(leaf_handle).as_leaf().key(index).clone();
         Some(OccupiedEntry {
             key,
-            leaf_handle: last_leaf,
+            leaf_handle,
             index,
             tree: &mut self.raw,
         })
@@ -1135,91 +1123,7 @@ impl<K, V> OSBTreeMap<K, V> {
         R: RangeBounds<T>,
     {
         validate_range_bounds(&range);
-
-        // Find front position based on start bound
-        let (front_leaf, front_index) = match range.start_bound() {
-            Bound::Unbounded => {
-                if let Some(first) = self.raw.first_leaf() {
-                    (Some(first), 0)
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Included(start) => {
-                if let Some((handle, idx)) = self.raw.lower_bound(start) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Excluded(start) => {
-                if let Some((handle, idx)) = self.raw.upper_bound(start) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-        };
-
-        // Find back position based on end bound
-        let (back_leaf, back_index) = match range.end_bound() {
-            Bound::Unbounded => {
-                if let Some(last) = self.raw.last_leaf() {
-                    let leaf = self.raw.node(last).as_leaf();
-                    let count = leaf.key_count();
-                    if count > 0 {
-                        (Some(last), count - 1)
-                    } else {
-                        (None, 0)
-                    }
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Included(end) => {
-                if let Some((handle, idx)) = self.raw.upper_bound_inclusive(end) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Excluded(end) => {
-                if let Some((handle, idx)) = self.raw.lower_bound_exclusive(end) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-        };
-
-        // Check if the range is empty (front position > back position, even across different leaves)
-        let (finished, remaining) = match (front_leaf, back_leaf) {
-            (Some(front), Some(back)) => {
-                let front_key = self.raw.node(front).as_leaf().key(front_index);
-                let back_key = self.raw.node(back).as_leaf().key(back_index);
-                if front_key > back_key {
-                    (true, 0)
-                } else {
-                    // Compute exact count using order statistics (O(log n) each).
-                    // Explicitly specify K as the query type since T is also in scope.
-                    let front_rank = self.raw.rank_of::<K>(front_key).unwrap_or(0);
-                    let back_rank = self.raw.rank_of::<K>(back_key).unwrap_or(0);
-                    (false, back_rank - front_rank + 1)
-                }
-            }
-            _ => (true, 0), // One or both bounds are out of range
-        };
-
-        Range {
-            tree: &raw const self.raw,
-            front_leaf,
-            front_index,
-            back_leaf,
-            back_index,
-            remaining,
-            finished,
-            _marker: PhantomData,
-        }
+        Range::from_cursor(&raw const self.raw, self.raw.range_cursor(&range))
     }
 
     /// Constructs a mutable double-ended iterator over a sub-range of elements in the map.
@@ -1259,91 +1163,8 @@ impl<K, V> OSBTreeMap<K, V> {
         R: RangeBounds<T>,
     {
         validate_range_bounds(&range);
-
-        // Find front position based on start bound
-        let (front_leaf, front_index) = match range.start_bound() {
-            Bound::Unbounded => {
-                if let Some(first) = self.raw.first_leaf() {
-                    (Some(first), 0)
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Included(start) => {
-                if let Some((handle, idx)) = self.raw.lower_bound(start) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Excluded(start) => {
-                if let Some((handle, idx)) = self.raw.upper_bound(start) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-        };
-
-        // Find back position based on end bound
-        let (back_leaf, back_index) = match range.end_bound() {
-            Bound::Unbounded => {
-                if let Some(last) = self.raw.last_leaf() {
-                    let leaf = self.raw.node(last).as_leaf();
-                    let count = leaf.key_count();
-                    if count > 0 {
-                        (Some(last), count - 1)
-                    } else {
-                        (None, 0)
-                    }
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Included(end) => {
-                if let Some((handle, idx)) = self.raw.upper_bound_inclusive(end) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-            Bound::Excluded(end) => {
-                if let Some((handle, idx)) = self.raw.lower_bound_exclusive(end) {
-                    (Some(handle), idx)
-                } else {
-                    (None, 0)
-                }
-            }
-        };
-
-        // Check if the range is empty (front position > back position, even across different leaves)
-        let (finished, remaining) = match (front_leaf, back_leaf) {
-            (Some(front), Some(back)) => {
-                let front_key = self.raw.node(front).as_leaf().key(front_index);
-                let back_key = self.raw.node(back).as_leaf().key(back_index);
-                if front_key > back_key {
-                    (true, 0)
-                } else {
-                    // Compute exact count using order statistics (O(log n) each).
-                    // Explicitly specify K as the query type since T is also in scope.
-                    let front_rank = self.raw.rank_of::<K>(front_key).unwrap_or(0);
-                    let back_rank = self.raw.rank_of::<K>(back_key).unwrap_or(0);
-                    (false, back_rank - front_rank + 1)
-                }
-            }
-            _ => (true, 0), // One or both bounds are out of range
-        };
-
-        RangeMut {
-            tree: &raw mut self.raw,
-            front_leaf,
-            front_index,
-            back_leaf,
-            back_index,
-            remaining,
-            finished,
-            _marker: PhantomData,
-        }
+        let cursor = self.raw.range_cursor(&range);
+        RangeMut::from_cursor(&raw mut self.raw, cursor)
     }
 
     /// Gets the given key's corresponding entry in the map for in-place manipulation.
@@ -1487,18 +1308,9 @@ impl<K, V> OSBTreeMap<K, V> {
         R: RangeBounds<K>,
         F: FnMut(&K, &mut V) -> bool,
     {
-        // Collect keys in range upfront
-        let keys: alloc::vec::Vec<K> = self
-            .range::<K, _>((range.start_bound().cloned(), range.end_bound().cloned()))
-            .map(|(k, _)| k.clone())
-            .collect();
-
         ExtractIf {
-            tree: &mut self.raw,
-            keys,
-            index: 0,
             pred,
-            _marker: PhantomData,
+            inner: self.extract_if_inner(range),
         }
     }
 
@@ -1602,23 +1414,13 @@ impl<K, V> OSBTreeMap<K, V> {
     /// O(1) to create the iterator; O(1) per iteration step via linked leaves.
     pub fn iter(&self) -> Iter<'_, K, V> {
         let first_leaf = self.raw.first_leaf();
-        let last_leaf = self.raw.last_leaf();
-        let back_index = if let Some(h) = last_leaf {
-            let leaf = self.raw.node(h).as_leaf();
-            if leaf.key_count() > 0 {
-                leaf.key_count() - 1
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let (back_leaf, back_index) = self.raw.last_position().unzip();
         Iter {
             tree: &raw const self.raw,
             front_leaf: first_leaf,
             front_index: 0,
-            back_leaf: last_leaf,
-            back_index,
+            back_leaf,
+            back_index: back_index.unwrap_or(0),
             remaining: self.raw.len(),
             _marker: PhantomData,
         }
@@ -1650,23 +1452,13 @@ impl<K, V> OSBTreeMap<K, V> {
     /// O(1) to create the iterator; O(1) per iteration step via linked leaves.
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         let first_leaf = self.raw.first_leaf();
-        let last_leaf = self.raw.last_leaf();
-        let back_index = if let Some(h) = last_leaf {
-            let leaf = self.raw.node(h).as_leaf();
-            if leaf.key_count() > 0 {
-                leaf.key_count() - 1
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let (back_leaf, back_index) = self.raw.last_position().unzip();
         IterMut {
             tree: &raw mut self.raw,
             front_leaf: first_leaf,
             front_index: 0,
-            back_leaf: last_leaf,
-            back_index,
+            back_leaf,
+            back_index: back_index.unwrap_or(0),
             remaining: self.raw.len(),
             _marker: PhantomData,
         }
@@ -2147,7 +1939,9 @@ impl<'a, K: 'a, V: 'a> Default for IterMut<'a, K, V> {
     /// ```
     fn default() -> Self {
         IterMut {
-            tree: core::ptr::null_mut(),
+            // SAFETY: tree is never dereferenced when remaining == 0 and front_leaf/back_leaf
+            // are None, so a dangling pointer is safe here.
+            tree: core::ptr::NonNull::dangling().as_ptr(),
             front_leaf: None,
             front_index: 0,
             back_leaf: None,
@@ -2464,6 +2258,22 @@ impl<K, V> Default for IntoValues<K, V> {
     }
 }
 
+impl<K, V> Range<'_, K, V> {
+    /// Creates a range iterator over the positions resolved by `cursor`.
+    fn from_cursor(tree: *const RawOSBTreeMap<K, V>, cursor: RangeCursor) -> Self {
+        Range {
+            tree,
+            front_leaf: cursor.front_leaf,
+            front_index: cursor.front_index,
+            back_leaf: cursor.back_leaf,
+            back_index: cursor.back_index,
+            remaining: cursor.len,
+            finished: cursor.len == 0,
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<'a, K, V> Iterator for Range<'a, K, V> {
     type Item = (&'a K, &'a V);
 
@@ -2617,6 +2427,22 @@ impl<K, V> Clone for Range<'_, K, V> {
     }
 }
 
+impl<K, V> RangeMut<'_, K, V> {
+    /// Creates a range iterator over the positions resolved by `cursor`.
+    fn from_cursor(tree: *mut RawOSBTreeMap<K, V>, cursor: RangeCursor) -> Self {
+        RangeMut {
+            tree,
+            front_leaf: cursor.front_leaf,
+            front_index: cursor.front_index,
+            back_leaf: cursor.back_leaf,
+            back_index: cursor.back_index,
+            remaining: cursor.len,
+            finished: cursor.len == 0,
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<'a, K, V> Iterator for RangeMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
 
@@ -2748,7 +2574,8 @@ impl<K, V> Default for RangeMut<'_, K, V> {
     /// ```
     fn default() -> Self {
         RangeMut {
-            tree: core::ptr::null_mut(),
+            // SAFETY: tree is never dereferenced when finished == true and leaves are None.
+            tree: core::ptr::NonNull::dangling().as_ptr(),
             front_leaf: None,
             front_index: 0,
             back_leaf: None,
@@ -2763,8 +2590,8 @@ impl<K, V> Default for RangeMut<'_, K, V> {
 impl<K, V, R, F> fmt::Debug for ExtractIf<'_, K, V, R, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractIf")
-            .field("index", &self.index)
-            .field("remaining", &(self.keys.len() - self.index))
+            .field("index", &self.inner.index)
+            .field("remaining", &(self.inner.keys.len() - self.inner.index))
             .finish()
     }
 }
@@ -2778,25 +2605,11 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.keys.len() {
-            let key = &self.keys[self.index];
-            self.index += 1;
-
-            // Get mutable access to the value to check predicate.
-            // The borrow must end before we call remove_entry, so we scope it.
-            let should_remove = self.tree.get_mut(key).is_some_and(|value| (self.pred)(key, value));
-            if should_remove {
-                // Remove and return
-                if let Some((k, v)) = self.tree.remove_entry(key) {
-                    return Some((k, v));
-                }
-            }
-        }
-        None
+        self.inner.next(&mut self.pred)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.keys.len() - self.index))
+        self.inner.size_hint()
     }
 }
 

@@ -4,7 +4,6 @@ use core::cmp::{max, min};
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::{FusedIterator, Peekable};
-use core::marker::PhantomData;
 use core::ops::{BitAnd, BitOr, BitXor, RangeBounds, Sub};
 
 use crate::OSBTreeMap;
@@ -502,13 +501,9 @@ impl<T> OSBTreeSet<T> {
     where
         T: Ord + Clone,
     {
-        let (Some(self_min), Some(self_max)) = (self.first(), self.last()) else {
-            return Difference {
-                inner: DifferenceInner::Iterate(self.iter()),
-            };
-        };
-
-        let (Some(other_min), Some(other_max)) = (other.first(), other.last()) else {
+        let (Some(self_min), Some(self_max), Some(other_min), Some(other_max)) =
+            (self.first(), self.last(), other.first(), other.last())
+        else {
             return Difference {
                 inner: DifferenceInner::Iterate(self.iter()),
             };
@@ -613,13 +608,9 @@ impl<T> OSBTreeSet<T> {
         T: Ord + Clone,
     {
         // Check for empty sets
-        let (Some(self_min), Some(self_max)) = (self.first(), self.last()) else {
-            return Intersection {
-                inner: IntersectionInner::Answer(None),
-            };
-        };
-
-        let (Some(other_min), Some(other_max)) = (other.first(), other.last()) else {
+        let (Some(self_min), Some(self_max), Some(other_min), Some(other_max)) =
+            (self.first(), self.last(), other.first(), other.last())
+        else {
             return Intersection {
                 inner: IntersectionInner::Answer(None),
             };
@@ -789,19 +780,15 @@ impl<T> OSBTreeSet<T> {
     ///
     /// # Complexity
     ///
-    /// O(min(m, n) log max(m, n)) where m and n are the sizes of the two sets.
+    /// O(1) if the sets' key ranges don't overlap. Otherwise O(min(m, n) log max(m, n))
+    /// when one set is more than 16 times larger than the other, or O(m + n) when they are
+    /// closer in size, where m and n are the sizes of the two sets.
     #[must_use]
     pub fn is_disjoint(&self, other: &OSBTreeSet<T>) -> bool
     where
         T: Ord + Clone,
     {
-        // Two sets are disjoint if they have no elements in common
-        // Use the smaller set to iterate and check against the larger
-        if self.len() <= other.len() {
-            self.iter().all(|v| !other.contains(v))
-        } else {
-            other.iter().all(|v| !self.contains(v))
-        }
+        self.intersection(other).next().is_none()
     }
 
     /// Returns `true` if the set is a subset of another,

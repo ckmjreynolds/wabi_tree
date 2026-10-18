@@ -1,4 +1,5 @@
 use core::borrow::Borrow;
+use core::ops::{Bound, RangeBounds};
 
 use smallvec::SmallVec;
 
@@ -23,19 +24,15 @@ pub(crate) struct RawOSBTreeMap<K, V> {
     last_leaf: Option<Handle>,
 }
 
-/// Result of an insertion attempt.
-pub(crate) enum InsertResult<K> {
-    /// Insertion completed without split.
-    Done,
-    /// Node split occurred; parent needs to insert this new child.
-    Split {
-        /// The separator key for the new child.
-        separator: K,
-        /// Handle to the new (right) child.
-        new_child: Handle,
-        /// Size of the new child subtree.
-        new_child_size: Size,
-    },
+/// Positions of the first and last elements of a range, plus its length.
+/// Both positions are `None` (and `len` is 0) when the range is empty.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RangeCursor {
+    pub(crate) front_leaf: Option<Handle>,
+    pub(crate) front_index: usize,
+    pub(crate) back_leaf: Option<Handle>,
+    pub(crate) back_index: usize,
+    pub(crate) len: usize,
 }
 
 /// Path element for tracking traversal during mutations.
@@ -123,12 +120,8 @@ impl<K, V> RawOSBTreeMap<K, V> {
             current_leaf = next;
         }
 
-        // Clear the tree structure (nodes arena still holds empty leaves and internals)
-        self.nodes.clear();
-        self.root = None;
-        self.len = 0;
-        self.first_leaf = None;
-        self.last_leaf = None;
+        // Every value has been taken, so the tree can be reset wholesale.
+        self.clear();
 
         result
     }
@@ -139,11 +132,26 @@ impl<K, V> RawOSBTreeMap<K, V> {
     }
 
     /// Returns a reference to the last leaf, if any.
+    #[cfg(test)]
     pub(crate) fn last_leaf(&self) -> Option<Handle> {
         self.last_leaf
     }
 
+    /// Returns the position of the first element, if any.
+    pub(crate) fn first_position(&self) -> Option<(Handle, usize)> {
+        let first_leaf = self.first_leaf?;
+        (self.nodes.get(first_leaf).as_leaf().key_count() > 0).then_some((first_leaf, 0))
+    }
+
+    /// Returns the position of the last element, if any.
+    pub(crate) fn last_position(&self) -> Option<(Handle, usize)> {
+        let last_leaf = self.last_leaf?;
+        let count = self.nodes.get(last_leaf).as_leaf().key_count();
+        count.checked_sub(1).map(|idx| (last_leaf, idx))
+    }
+
     /// Returns a reference to the root node, if any.
+    #[cfg(test)]
     pub(crate) fn root(&self) -> Option<Handle> {
         self.root
     }
@@ -164,6 +172,7 @@ impl<K, V> RawOSBTreeMap<K, V> {
     }
 
     /// Returns a mutable reference to a node by handle.
+    #[cfg(test)]
     pub(crate) fn node_mut(&mut self, handle: Handle) -> &mut Node<K> {
         self.nodes.get_mut(handle)
     }
@@ -185,41 +194,149 @@ impl<K, V> RawOSBTreeMap<K, V> {
     /// - The caller must ensure no other mutable references to the values arena exist.
     /// - The caller must have logical exclusive access to the value at `handle`.
     pub(crate) unsafe fn value_mut_ptr<'a>(ptr: *mut Self, handle: Handle) -> &'a mut V {
-        // SAFETY: We only access the `values` field, avoiding aliasing with the `nodes` field.
-        unsafe { (*core::ptr::addr_of_mut!((*ptr).values)).get_mut(handle) }
+        // SAFETY: We only access the `values` field, avoiding aliasing with the `nodes` field,
+        // and `get_mut_ptr` borrows only the one slot, so values handed out earlier stay valid.
+        unsafe { Arena::get_mut_ptr(core::ptr::addr_of_mut!((*ptr).values), handle) }
     }
 
     /// Takes a value from the arena.
+    #[cfg(test)]
     pub(crate) fn take_value(&mut self, handle: Handle) -> V {
         self.values.take(handle)
     }
 }
 
+/// Clones only the live entries, so the clone is O(len) and compact even if the original has
+/// many free arena slots from earlier removals. The clone keeps the original's capacity.
+impl<K: Clone, V: Clone> Clone for RawOSBTreeMap<K, V> {
+    fn clone(&self) -> Self {
+        /// Clones the subtree at `handle` into `out`, linking each cloned leaf after
+        /// `out.last_leaf` (leaves are visited left to right). Returns the new handle.
+        fn clone_node<K: Clone, V: Clone>(
+            src: &RawOSBTreeMap<K, V>,
+            out: &mut RawOSBTreeMap<K, V>,
+            handle: Handle,
+        ) -> Handle {
+            match src.nodes.get(handle) {
+                Node::Leaf(leaf) => {
+                    let mut new_leaf = LeafNode::new();
+                    for i in 0..leaf.key_count() {
+                        let value_handle = out.values.alloc(src.values.get(leaf.value(i)).clone());
+                        new_leaf.push(leaf.key(i).clone(), value_handle);
+                    }
+                    new_leaf.set_prev(out.last_leaf);
+                    let new_handle = out.nodes.alloc(Node::Leaf(new_leaf));
+                    match out.last_leaf {
+                        Some(prev) => out.nodes.get_mut(prev).as_leaf_mut().set_next(Some(new_handle)),
+                        None => out.first_leaf = Some(new_handle),
+                    }
+                    out.last_leaf = Some(new_handle);
+                    new_handle
+                }
+                Node::Internal(internal) => {
+                    let mut new_internal = InternalNode::new();
+                    let first = clone_node(src, out, internal.child(0));
+                    new_internal.set_first_child(first, internal.child_size(0));
+                    for i in 0..internal.key_count() {
+                        let child = clone_node(src, out, internal.child(i + 1));
+                        new_internal.push_child(internal.key(i).clone(), child, internal.child_size(i + 1));
+                    }
+                    new_internal.set_size(internal.size());
+                    out.nodes.alloc(Node::Internal(new_internal))
+                }
+            }
+        }
+
+        let mut out = Self {
+            nodes: Arena::with_capacity(self.nodes.capacity()),
+            values: Arena::with_capacity(self.values.capacity()),
+            root: None,
+            len: self.len,
+            first_leaf: None,
+            last_leaf: None,
+        };
+        if let Some(root) = self.root {
+            out.root = Some(clone_node(self, &mut out, root));
+        }
+        out
+    }
+}
+
 impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
+    /// Descends from `root` to a leaf and returns the leaf's handle. At each internal node,
+    /// `pick` receives the node's handle and the node, and returns the child to descend into.
+    #[inline]
+    fn descend(&self, root: Handle, mut pick: impl FnMut(Handle, &InternalNode<K>) -> usize) -> Handle {
+        let mut current = root;
+        while let Node::Internal(internal) = self.nodes.get(current) {
+            current = internal.child(pick(current, internal));
+        }
+        current
+    }
+
+    /// Descends from the root to the leaf whose key range covers `key`.
+    #[inline]
+    fn find_leaf<Q>(&self, key: &Q) -> Option<(Handle, &LeafNode<K>)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        let leaf = self.descend(self.root?, |_, internal| internal.search_child(key));
+        Some((leaf, self.nodes.get(leaf).as_leaf()))
+    }
+
+    /// Like [`Self::find_leaf`], but also returns the number of elements stored in
+    /// leaves to the left of the returned leaf.
+    fn find_leaf_with_rank<Q>(&self, key: &Q) -> Option<(Handle, &LeafNode<K>, usize)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        let mut rank = 0;
+        let leaf = self.descend(self.root?, |_, internal| {
+            let child_idx = internal.search_child(key);
+            rank += internal.child_sizes()[..child_idx].iter().map(|s| s.to_usize()).sum::<usize>();
+            child_idx
+        });
+        Some((leaf, self.nodes.get(leaf).as_leaf(), rank))
+    }
+
+    /// Descends from `root` to a leaf, recording the path taken in `path` (which the
+    /// caller owns, to avoid moving the inline buffer). `pick` chooses the child to
+    /// descend into at each internal node.
+    fn descend_with_path(
+        &self,
+        root: Handle,
+        path: &mut Path,
+        mut pick: impl FnMut(&InternalNode<K>) -> usize,
+    ) -> Handle {
+        self.descend(root, |node, internal| {
+            let child_index = pick(internal);
+            path.push(PathElement {
+                node,
+                child_index,
+            });
+            child_index
+        })
+    }
+
     /// Searches for a key and returns the leaf handle and index if found.
     pub(crate) fn search<Q>(&self, key: &Q) -> Option<(Handle, usize)>
     where
         K: Borrow<Q>,
         Q: ?Sized + Ord,
     {
-        let root = self.root?;
-        let mut current = root;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(key);
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(leaf) => {
-                    if let SearchResult::Found(idx) = leaf.search(key) {
-                        return Some((current, idx));
-                    }
-                    return None;
-                }
-            }
+        let (leaf_handle, leaf) = self.find_leaf(key)?;
+        match leaf.search(key) {
+            SearchResult::Found(idx) => Some((leaf_handle, idx)),
+            SearchResult::NotFound(_) => None,
         }
+    }
+
+    /// Returns the key-value pair at a position.
+    fn entry_at(&self, (leaf_handle, idx): (Handle, usize)) -> (&K, &V) {
+        let leaf = self.nodes.get(leaf_handle).as_leaf();
+        (leaf.key(idx), self.values.get(leaf.value(idx)))
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -229,8 +346,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         Q: ?Sized + Ord,
     {
         let (leaf_handle, idx) = self.search(key)?;
-        let leaf = self.nodes.get(leaf_handle).as_leaf();
-        let value_handle = leaf.value(idx);
+        let value_handle = self.nodes.get(leaf_handle).as_leaf().value(idx);
         Some(self.values.get(value_handle))
     }
 
@@ -252,11 +368,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         K: Borrow<Q>,
         Q: ?Sized + Ord,
     {
-        let (leaf_handle, idx) = self.search(key)?;
-        let leaf = self.nodes.get(leaf_handle).as_leaf();
-        let k = leaf.key(idx);
-        let value_handle = leaf.value(idx);
-        Some((k, self.values.get(value_handle)))
+        self.search(key).map(|pos| self.entry_at(pos))
     }
 
     /// Returns true if the tree contains the specified key.
@@ -270,34 +382,25 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
 
     /// Returns the first key-value pair in the tree.
     pub(crate) fn first_key_value(&self) -> Option<(&K, &V)> {
-        let first_leaf = self.first_leaf?;
-        let leaf = self.nodes.get(first_leaf).as_leaf();
-        if leaf.key_count() == 0 {
-            return None;
-        }
-        let k = leaf.key(0);
-        let value_handle = leaf.value(0);
-        Some((k, self.values.get(value_handle)))
+        self.first_position().map(|pos| self.entry_at(pos))
     }
 
     /// Returns the last key-value pair in the tree.
     pub(crate) fn last_key_value(&self) -> Option<(&K, &V)> {
-        let last_leaf = self.last_leaf?;
-        let leaf = self.nodes.get(last_leaf).as_leaf();
-        let count = leaf.key_count();
-        if count == 0 {
-            return None;
-        }
-        let k = leaf.key(count - 1);
-        let value_handle = leaf.value(count - 1);
-        Some((k, self.values.get(value_handle)))
+        self.last_position().map(|pos| self.entry_at(pos))
     }
 
     /// Inserts a key-value pair into the tree.
     /// Returns the old value if the key was already present.
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
-        // Handle empty tree case
-        if self.root.is_none() {
+        self.insert_with_handle(key, value).1
+    }
+
+    /// Inserts a key-value pair into the tree, returning the handle of the stored value
+    /// and the old value if the key was already present. Value handles are stable across
+    /// node splits, so the handle stays valid until the entry is removed.
+    pub(crate) fn insert_with_handle(&mut self, key: K, value: V) -> (Handle, Option<V>) {
+        let Some(root) = self.root else {
             let value_handle = self.values.alloc(value);
             let mut leaf = LeafNode::new();
             leaf.push(key, value_handle);
@@ -306,30 +409,11 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             self.first_leaf = Some(leaf_handle);
             self.last_leaf = Some(leaf_handle);
             self.len = 1;
-            return None;
-        }
+            return (value_handle, None);
+        };
 
-        let root = self.root.unwrap();
-
-        // Build path from root to leaf
-        let mut path: Path = SmallVec::new();
-        let mut current = root;
-
-        // Traverse to leaf
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(&key);
-                    path.push(PathElement {
-                        node: current,
-                        child_index: child_idx,
-                    });
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(_) => break,
-            }
-        }
+        let mut path = Path::new();
+        let current = self.descend_with_path(root, &mut path, |internal| internal.search_child(&key));
 
         // Insert into leaf
         let leaf = self.nodes.get_mut(current).as_leaf_mut();
@@ -338,7 +422,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 // Key exists, replace value in-place to avoid alloc/free churn
                 let value_handle = leaf.value(idx);
                 let old_value = core::mem::replace(self.values.get_mut(value_handle), value);
-                Some(old_value)
+                (value_handle, Some(old_value))
             }
             SearchResult::NotFound(idx) => {
                 // Insert new key-value
@@ -346,15 +430,15 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 leaf.insert(idx, key, value_handle);
                 self.len += 1;
 
-                // Check if we need to split
-                if leaf.key_count() > MAX_KEYS {
+                // Count the new element before splitting: a split only clones keys, so if
+                // `K::clone` panics the tree is left consistent, with one oversized leaf.
+                let needs_split = leaf.key_count() > MAX_KEYS;
+                self.adjust_sizes_along_path(&path, |size| size + 1);
+                if needs_split {
                     self.split_leaf_and_propagate(current, &mut path);
-                } else {
-                    // Update sizes along the path
-                    self.increment_sizes_along_path(&path);
                 }
 
-                None
+                (value_handle, None)
             }
         }
     }
@@ -394,7 +478,8 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         self.propagate_split(path, separator, right_handle, left_size, right_size);
     }
 
-    /// Propagates a split up the tree.
+    /// Propagates a split up the tree. Sizes along `path` must already count the inserted
+    /// element; each node that gains a child here recomputes its sizes from its children.
     fn propagate_split(
         &mut self,
         path: &mut Path,
@@ -410,13 +495,12 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             parent.set_child_size(elem.child_index, left_size);
 
             // Insert the new child
-            parent.insert_child(elem.child_index, separator.clone(), new_child, right_size);
+            parent.insert_child(elem.child_index, separator, new_child, right_size);
             parent.update_size();
 
             // Check if parent needs to split
             if parent.key_count() <= MAX_KEYS {
-                // No more splits needed, just update sizes along remaining path
-                self.update_sizes_along_path(path);
+                // No more splits needed; the remaining ancestors were already counted.
                 return;
             }
 
@@ -433,10 +517,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
 
         // Need a new root
         let old_root = self.root.unwrap();
-        let old_root_size = match self.nodes.get(old_root) {
-            Node::Internal(internal) => internal.size(),
-            Node::Leaf(leaf) => Size::from_usize(leaf.key_count()),
-        };
+        let old_root_size = self.nodes.get(old_root).subtree_size();
 
         let mut new_root = InternalNode::new();
         new_root.set_first_child(old_root, old_root_size);
@@ -447,33 +528,27 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         self.root = Some(new_root_handle);
     }
 
-    /// Updates sizes along the remaining path after a split that didn't propagate further.
-    /// Recomputes each ancestor's `child_size` for the child we descended through,
-    /// then recomputes the ancestor's total size.
-    fn update_sizes_along_path(&mut self, path: &Path) {
-        for elem in path.iter().rev() {
-            let parent = self.nodes.get(elem.node).as_internal();
-            let child_handle = parent.child(elem.child_index);
-            let child_size = match self.nodes.get(child_handle) {
-                Node::Internal(internal) => internal.size(),
-                Node::Leaf(leaf) => Size::from_usize(leaf.key_count()),
-            };
-            let parent = self.nodes.get_mut(elem.node).as_internal_mut();
-            parent.set_child_size(elem.child_index, child_size);
-            parent.update_size();
+    /// Applies `adjust` to the total size of every node on `path` and to the size it
+    /// records for the child it descended into. Used when an insertion or removal
+    /// changes the element count by one without restructuring those nodes.
+    fn adjust_sizes_along_path(&mut self, path: &Path, adjust: impl Fn(usize) -> usize) {
+        for elem in path {
+            let node = self.nodes.get_mut(elem.node).as_internal_mut();
+            node.set_size(Size::from_usize(adjust(node.size().to_usize())));
+            let child_size = adjust(node.child_size(elem.child_index).to_usize());
+            node.set_child_size(elem.child_index, Size::from_usize(child_size));
         }
     }
 
-    /// Increments sizes along the path after a simple insertion (no split).
-    fn increment_sizes_along_path(&mut self, path: &Path) {
+    /// Recomputes sizes bottom-up along `path`: each node's recorded size for the child
+    /// it descended into, then the node's own total size.
+    fn refresh_sizes(&mut self, path: &Path) {
         for elem in path.iter().rev() {
-            let node = self.nodes.get_mut(elem.node).as_internal_mut();
-            // Increment the overall node size
-            let new_size = node.size().to_usize() + 1;
-            node.set_size(Size::from_usize(new_size));
-            // Also increment the specific child's size
-            let child_size = node.child_size(elem.child_index).to_usize() + 1;
-            node.set_child_size(elem.child_index, Size::from_usize(child_size));
+            let child = self.nodes.get(elem.node).as_internal().child(elem.child_index);
+            let child_size = self.nodes.get(child).subtree_size();
+            let parent = self.nodes.get_mut(elem.node).as_internal_mut();
+            parent.set_child_size(elem.child_index, child_size);
+            parent.update_size();
         }
     }
 
@@ -493,76 +568,67 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         Q: ?Sized + Ord,
     {
         let root = self.root?;
-
-        // Build path from root to leaf
-        let mut path: Path = SmallVec::new();
-        let mut current = root;
-
-        // Traverse to leaf
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(key);
-                    path.push(PathElement {
-                        node: current,
-                        child_index: child_idx,
-                    });
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(_) => break,
-            }
-        }
-
-        // Find and remove from leaf
-        let leaf = self.nodes.get_mut(current).as_leaf_mut();
-        let idx = match leaf.search(key) {
-            SearchResult::Found(idx) => idx,
-            SearchResult::NotFound(_) => return None,
+        let mut path = Path::new();
+        let leaf_handle = self.descend_with_path(root, &mut path, |internal| internal.search_child(key));
+        let SearchResult::Found(idx) = self.nodes.get(leaf_handle).as_leaf().search(key) else {
+            return None;
         };
+        Some(self.remove_at(leaf_handle, idx, &mut path))
+    }
 
-        let (removed_key, value_handle) = leaf.remove(idx);
+    /// Removes and returns the first key-value pair.
+    pub(crate) fn pop_first(&mut self) -> Option<(K, V)> {
+        let root = self.root?;
+        let mut path = Path::new();
+        let leaf_handle = self.descend_with_path(root, &mut path, |_| 0);
+        Some(self.remove_at(leaf_handle, 0, &mut path))
+    }
+
+    /// Removes and returns the last key-value pair.
+    pub(crate) fn pop_last(&mut self) -> Option<(K, V)> {
+        let root = self.root?;
+        let mut path = Path::new();
+        let leaf_handle = self.descend_with_path(root, &mut path, |internal| internal.child_count() - 1);
+        let last_idx = self.nodes.get(leaf_handle).as_leaf().key_count() - 1;
+        Some(self.remove_at(leaf_handle, last_idx, &mut path))
+    }
+
+    /// Removes the element at `idx` in the leaf reached via `path`, rebalancing as needed.
+    fn remove_at(&mut self, leaf_handle: Handle, idx: usize, path: &mut Path) -> (K, V) {
+        let (removed_key, value_handle) = self.nodes.get_mut(leaf_handle).as_leaf_mut().remove(idx);
         let removed_value = self.values.take(value_handle);
         self.len -= 1;
 
-        // Handle empty tree
         if self.len == 0 {
-            self.nodes.clear();
-            self.root = None;
-            self.first_leaf = None;
-            self.last_leaf = None;
-            return Some((removed_key, removed_value));
+            self.clear();
+            return (removed_key, removed_value);
         }
 
-        // Check if we need to rebalance
-        let leaf = self.nodes.get(current).as_leaf();
-        if !leaf.is_at_minimum() || path.is_empty() {
-            // Update separator keys if needed
-            self.update_separators_after_remove(current, &path);
-            // Update sizes
-            self.update_sizes_after_remove(current, &path);
-            return Some((removed_key, removed_value));
+        // Uncount the element before anything that clones a key, so a panicking `K::clone`
+        // leaves sizes consistent. Rebalancing recomputes the sizes of the nodes it touches.
+        self.adjust_sizes_along_path(path, |size| size - 1);
+        if !self.nodes.get(leaf_handle).as_leaf().is_at_minimum() || path.is_empty() {
+            // A stale separator is still a valid bound, so it's fine if this clone panics.
+            self.update_separators_after_remove(leaf_handle, idx, path);
+        } else {
+            self.rebalance_leaf(leaf_handle, path);
         }
 
-        // Need to rebalance
-        self.rebalance_leaf(current, &mut path);
-
-        Some((removed_key, removed_value))
+        (removed_key, removed_value)
     }
 
-    /// Updates separator keys after a removal.
-    fn update_separators_after_remove(&mut self, leaf_handle: Handle, path: &Path) {
-        if path.is_empty() {
-            return;
-        }
-
+    /// Updates the separator bounding `leaf_handle` after removing the element at
+    /// `removed_idx`. Separators equal the max key of their left subtree, so this is
+    /// only needed when the leaf's last key was removed.
+    fn update_separators_after_remove(&mut self, leaf_handle: Handle, removed_idx: usize, path: &Path) {
         let leaf = self.nodes.get(leaf_handle).as_leaf();
-        if leaf.key_count() == 0 {
+        if path.is_empty() || removed_idx != leaf.key_count() {
             return;
         }
-
-        // Update the separator in the parent if this was a rightmost key
-        let last_key = leaf.last_key().unwrap().clone();
+        let Some(last_key) = leaf.last_key() else {
+            return;
+        };
+        let last_key = last_key.clone();
 
         for elem in path.iter().rev() {
             let parent = self.nodes.get_mut(elem.node).as_internal_mut();
@@ -570,31 +636,6 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 parent.set_key(elem.child_index, last_key);
                 break;
             }
-        }
-    }
-
-    /// Updates sizes along the path after a removal by recomputing from children.
-    fn update_sizes_after_remove(&mut self, leaf_handle: Handle, path: &Path) {
-        // First update the immediate parent's child size for this leaf
-        if let Some(elem) = path.last() {
-            let leaf = self.nodes.get(leaf_handle).as_leaf();
-            let leaf_size = Size::from_usize(leaf.key_count());
-            let parent = self.nodes.get_mut(elem.node).as_internal_mut();
-            parent.set_child_size(elem.child_index, leaf_size);
-            parent.update_size();
-        }
-
-        // Then update all ancestor sizes (recomputing child_sizes from actual children)
-        for elem in path.iter().rev().skip(1) {
-            let parent = self.nodes.get(elem.node).as_internal();
-            let child_handle = parent.child(elem.child_index);
-            let child_size = match self.nodes.get(child_handle) {
-                Node::Internal(internal) => internal.size(),
-                Node::Leaf(leaf) => Size::from_usize(leaf.key_count()),
-            };
-            let parent = self.nodes.get_mut(elem.node).as_internal_mut();
-            parent.set_child_size(elem.child_index, child_size);
-            parent.update_size();
         }
     }
 
@@ -613,7 +654,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             if left_sibling.can_lend() {
                 self.borrow_from_left_leaf(leaf_handle, left_sibling_handle, parent_handle, child_idx);
                 // Update overall sizes along path (child sizes already updated in borrow)
-                self.update_sizes_from_path(path);
+                self.refresh_sizes(path);
                 return;
             }
         }
@@ -625,7 +666,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             if right_sibling.can_lend() {
                 self.borrow_from_right_leaf(leaf_handle, right_sibling_handle, parent_handle, child_idx);
                 // Update overall sizes along path (child sizes already updated in borrow)
-                self.update_sizes_from_path(path);
+                self.refresh_sizes(path);
                 return;
             }
         }
@@ -650,11 +691,14 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         parent_handle: Handle,
         child_idx: usize,
     ) {
-        // Pop from left sibling
+        // Clone the left sibling's new last key before popping, so a panicking `K::clone`
+        // leaves both leaves intact.
         let left = self.nodes.get_mut(left_handle).as_leaf_mut();
+        let left_new_last_key = left.key(left.key_count() - 2).clone();
+
+        // Pop from left sibling
         let (key, value) = left.pop().unwrap();
         let left_new_size = left.key_count();
-        let left_new_last_key = left.last_key().unwrap().clone();
 
         // Push to front of current leaf
         let leaf = self.nodes.get_mut(leaf_handle).as_leaf_mut();
@@ -676,21 +720,25 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         parent_handle: Handle,
         child_idx: usize,
     ) {
-        // Pop from front of right sibling
+        // Clone the borrowed key before popping, so a panicking `K::clone` leaves both leaves
+        // intact.
         let right = self.nodes.get_mut(right_handle).as_leaf_mut();
+        let separator = right.key(0).clone();
+
+        // Pop from front of right sibling
         let (key, value) = right.pop_front().unwrap();
         let right_new_size = right.key_count();
 
         // Push to end of current leaf
         let leaf = self.nodes.get_mut(leaf_handle).as_leaf_mut();
-        leaf.push(key.clone(), value);
+        leaf.push(key, value);
         let current_new_size = leaf.key_count();
 
         // Update parent separator and child sizes.
         // The borrowed key becomes the new max key of the current node,
         // so it's the correct separator for child_idx.
         let parent = self.nodes.get_mut(parent_handle).as_internal_mut();
-        parent.set_key(child_idx, key);
+        parent.set_key(child_idx, separator);
         parent.set_child_size(child_idx, Size::from_usize(current_new_size));
         parent.set_child_size(child_idx + 1, Size::from_usize(right_new_size));
     }
@@ -731,19 +779,13 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         let parent_elem = path.pop().unwrap();
         let parent_handle = parent_elem.node;
 
+        // The removed child's node was already taken by the merge, so it isn't freed here.
         let parent = self.nodes.get_mut(parent_handle).as_internal_mut();
-        let (_sep_key, removed_child, _removed_size) = parent.remove_child(separator_idx);
-
-        // Free the removed child handle (already taken during merge)
-        // Note: The node was already taken in merge_leaves, so we don't free here
-        let _ = removed_child;
+        parent.remove_child(separator_idx);
 
         // Update the merged child's size in the parent (the left child absorbed the right)
         let merged_child_handle = parent.child(separator_idx);
-        let merged_child_size = match self.nodes.get(merged_child_handle) {
-            Node::Internal(internal) => internal.size(),
-            Node::Leaf(leaf) => Size::from_usize(leaf.key_count()),
-        };
+        let merged_child_size = self.nodes.get(merged_child_handle).subtree_size();
         let parent = self.nodes.get_mut(parent_handle).as_internal_mut();
         parent.set_child_size(separator_idx, merged_child_size);
         parent.update_size();
@@ -761,18 +803,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         }
 
         if !parent.is_at_minimum() {
-            // Update sizes along remaining path
-            for elem in path.iter().rev() {
-                let parent = self.nodes.get(elem.node).as_internal();
-                let child_handle = parent.child(elem.child_index);
-                let child_size = match self.nodes.get(child_handle) {
-                    Node::Internal(internal) => internal.size(),
-                    Node::Leaf(leaf) => Size::from_usize(leaf.key_count()),
-                };
-                let parent = self.nodes.get_mut(elem.node).as_internal_mut();
-                parent.set_child_size(elem.child_index, child_size);
-                parent.update_size();
-            }
+            self.refresh_sizes(path);
             return;
         }
 
@@ -794,7 +825,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             let left_sibling = self.nodes.get(left_sibling_handle).as_internal();
             if left_sibling.can_lend() {
                 self.borrow_from_left_internal(node_handle, left_sibling_handle, parent_handle, child_idx);
-                self.update_sizes_from_path(path);
+                self.refresh_sizes(path);
                 return;
             }
         }
@@ -805,7 +836,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             let right_sibling = self.nodes.get(right_sibling_handle).as_internal();
             if right_sibling.can_lend() {
                 self.borrow_from_right_internal(node_handle, right_sibling_handle, parent_handle, child_idx);
-                self.update_sizes_from_path(path);
+                self.refresh_sizes(path);
                 return;
             }
         }
@@ -908,222 +939,50 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         self.remove_from_parent_and_propagate(path, separator_idx);
     }
 
-    /// Updates sizes from a path.
-    fn update_sizes_from_path(&mut self, path: &Path) {
-        for elem in path.iter().rev() {
-            let parent = self.nodes.get(elem.node).as_internal();
-            let child_handle = parent.child(elem.child_index);
-            let child_size = match self.nodes.get(child_handle) {
-                Node::Internal(internal) => internal.size(),
-                Node::Leaf(leaf) => Size::from_usize(leaf.key_count()),
-            };
-            let parent = self.nodes.get_mut(elem.node).as_internal_mut();
-            parent.set_child_size(elem.child_index, child_size);
-            parent.update_size();
+    /// Returns the position of the element with the given rank.
+    fn locate_rank(&self, rank: usize) -> Option<(Handle, usize)> {
+        if rank >= self.len {
+            return None;
         }
-    }
 
-    /// Removes and returns the first key-value pair.
-    pub(crate) fn pop_first(&mut self) -> Option<(K, V)> {
-        let root = self.root?;
+        let mut current = self.root?;
+        let mut remaining = rank;
 
-        // Build path to first leaf (always go to child 0)
-        let mut path: Path = SmallVec::new();
-        let mut current = root;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    path.push(PathElement {
-                        node: current,
-                        child_index: 0,
-                    });
-                    current = internal.child(0);
+        while let Node::Internal(internal) = self.nodes.get(current) {
+            // Find which child contains the rank
+            let mut found = false;
+            for i in 0..internal.child_count() {
+                let child_size = internal.child_size(i).to_usize();
+                if remaining < child_size {
+                    current = internal.child(i);
+                    found = true;
+                    break;
                 }
-                Node::Leaf(_) => break,
+                remaining -= child_size;
             }
+            // A real assert: in release builds a violated invariant would otherwise loop forever.
+            assert!(
+                found,
+                "locate_rank: tree size invariant violated - rank {} not found in children (node size: {})",
+                rank,
+                internal.size().to_usize()
+            );
         }
 
-        // Remove first element from leaf
-        let leaf = self.nodes.get_mut(current).as_leaf_mut();
-        let (removed_key, value_handle) = leaf.remove(0);
-        let removed_value = self.values.take(value_handle);
-        self.len -= 1;
-
-        // Handle empty tree
-        if self.len == 0 {
-            self.nodes.clear();
-            self.root = None;
-            self.first_leaf = None;
-            self.last_leaf = None;
-            return Some((removed_key, removed_value));
-        }
-
-        // Check if we need to rebalance
-        let leaf = self.nodes.get(current).as_leaf();
-        if !leaf.is_at_minimum() || path.is_empty() {
-            // Update separator keys if needed
-            self.update_separators_after_remove(current, &path);
-            // Update sizes
-            self.update_sizes_after_remove(current, &path);
-            return Some((removed_key, removed_value));
-        }
-
-        // Need to rebalance
-        self.rebalance_leaf(current, &mut path);
-
-        Some((removed_key, removed_value))
-    }
-
-    /// Removes and returns the last key-value pair.
-    pub(crate) fn pop_last(&mut self) -> Option<(K, V)> {
-        let root = self.root?;
-
-        // Build path to last leaf (always go to last child)
-        let mut path: Path = SmallVec::new();
-        let mut current = root;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let last_child_idx = internal.child_count() - 1;
-                    path.push(PathElement {
-                        node: current,
-                        child_index: last_child_idx,
-                    });
-                    current = internal.child(last_child_idx);
-                }
-                Node::Leaf(_) => break,
-            }
-        }
-
-        // Remove last element from leaf
-        let leaf = self.nodes.get_mut(current).as_leaf_mut();
-        let last_idx = leaf.key_count() - 1;
-        let (removed_key, value_handle) = leaf.remove(last_idx);
-        let removed_value = self.values.take(value_handle);
-        self.len -= 1;
-
-        // Handle empty tree
-        if self.len == 0 {
-            self.nodes.clear();
-            self.root = None;
-            self.first_leaf = None;
-            self.last_leaf = None;
-            return Some((removed_key, removed_value));
-        }
-
-        // Check if we need to rebalance
-        let leaf = self.nodes.get(current).as_leaf();
-        if !leaf.is_at_minimum() || path.is_empty() {
-            // Update separator keys if needed
-            self.update_separators_after_remove(current, &path);
-            // Update sizes
-            self.update_sizes_after_remove(current, &path);
-            return Some((removed_key, removed_value));
-        }
-
-        // Need to rebalance
-        self.rebalance_leaf(current, &mut path);
-
-        Some((removed_key, removed_value))
+        Some((current, remaining))
     }
 
     /// Gets an element by its rank (0-indexed position in sorted order).
     pub(crate) fn get_by_rank(&self, rank: usize) -> Option<(&K, &V)> {
-        if rank >= self.len {
-            return None;
-        }
-
-        let root = self.root?;
-        let mut current = root;
-        let mut remaining = rank;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    // Find which child contains the rank
-                    let mut found = false;
-                    for i in 0..internal.child_count() {
-                        let child_size = internal.child_size(i).to_usize();
-                        if remaining < child_size {
-                            current = internal.child(i);
-                            found = true;
-                            break;
-                        }
-                        remaining -= child_size;
-                    }
-                    debug_assert!(
-                        found,
-                        "get_by_rank: tree size invariant violated - rank {} not found in children (node size: {})",
-                        rank,
-                        internal.size().to_usize()
-                    );
-                }
-                Node::Leaf(leaf) => {
-                    let key = leaf.key(remaining);
-                    let value_handle = leaf.value(remaining);
-                    return Some((key, self.values.get(value_handle)));
-                }
-            }
-        }
+        self.locate_rank(rank).map(|pos| self.entry_at(pos))
     }
 
     /// Gets a mutable element by its rank.
     pub(crate) fn get_by_rank_mut(&mut self, rank: usize) -> Option<(&K, &mut V)> {
-        if rank >= self.len {
-            return None;
-        }
-
-        let root = self.root?;
-        let mut current = root;
-        let mut remaining = rank;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    // Find which child contains the rank
-                    let mut found = false;
-                    for i in 0..internal.child_count() {
-                        let child_size = internal.child_size(i).to_usize();
-                        if remaining < child_size {
-                            current = internal.child(i);
-                            found = true;
-                            break;
-                        }
-                        remaining -= child_size;
-                    }
-                    debug_assert!(
-                        found,
-                        "get_by_rank_mut: tree size invariant violated - rank {} not found in children (node size: {})",
-                        rank,
-                        internal.size().to_usize()
-                    );
-                }
-                Node::Leaf(leaf) => {
-                    let key = leaf.key(remaining);
-                    let value_handle = leaf.value(remaining);
-                    // We need to return both a reference to the key and a mutable reference
-                    // to the value. The borrow checker sees `self` as borrowed twice, but
-                    // this is actually safe because keys and values are stored in separate
-                    // arenas (self.nodes vs self.values) that don't alias.
-                    //
-                    // SAFETY:
-                    // - `key` points into `self.nodes` arena (via the leaf node)
-                    // - `value` points into `self.values` arena
-                    // - These arenas are disjoint memory regions
-                    // - We only mutate `self.values`, never `self.nodes`
-                    // - The key reference remains valid because we don't modify the nodes arena
-                    let key_ptr = core::ptr::from_ref::<K>(key);
-                    let value = self.values.get_mut(value_handle);
-                    return Some((unsafe { &*key_ptr }, value));
-                }
-            }
-        }
+        let (leaf_handle, idx) = self.locate_rank(rank)?;
+        // `nodes` and `values` are disjoint fields, so both can be borrowed at once.
+        let leaf = self.nodes.get(leaf_handle).as_leaf();
+        Some((leaf.key(idx), self.values.get_mut(leaf.value(idx))))
     }
 
     /// Returns the rank (0-indexed position) of a key.
@@ -1132,336 +991,102 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         K: Borrow<Q>,
         Q: ?Sized + Ord,
     {
-        let root = self.root?;
-        let mut current = root;
-        let mut rank = 0;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(key);
-                    // Add sizes of all children before the one we're descending into
-                    for i in 0..child_idx {
-                        rank += internal.child_size(i).to_usize();
-                    }
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(leaf) => match leaf.search(key) {
-                    SearchResult::Found(idx) => return Some(rank + idx),
-                    SearchResult::NotFound(_) => return None,
-                },
-            }
+        let (_, leaf, rank) = self.find_leaf_with_rank(key)?;
+        match leaf.search(key) {
+            SearchResult::Found(idx) => Some(rank + idx),
+            SearchResult::NotFound(_) => None,
         }
     }
 
-    /// Finds the lower bound position (first key >= given key).
-    /// Returns (`leaf_handle`, index) or None if all keys are less than the given key.
-    pub(crate) fn lower_bound<Q>(&self, key: &Q) -> Option<(Handle, usize)>
+    /// Locates the split point for `key`: the leaf it falls in, how many of that leaf's
+    /// keys come before the split, and how many elements in the whole tree come before
+    /// it. Keys equal to `key` come before the split only if `include_equal` is true.
+    fn split_point<Q>(&self, key: &Q, include_equal: bool) -> Option<(Handle, usize, usize)>
     where
         K: Borrow<Q>,
         Q: ?Sized + Ord,
     {
-        let root = self.root?;
-        let mut current = root;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(key);
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(leaf) => {
-                    // Find first key >= target
-                    match leaf.search(key) {
-                        SearchResult::Found(idx) => return Some((current, idx)),
-                        SearchResult::NotFound(idx) => {
-                            if idx < leaf.key_count() {
-                                return Some((current, idx));
-                            }
-                            // All keys in this leaf are < target, check next leaf
-                            if let Some(next) = leaf.next() {
-                                let next_leaf = self.nodes.get(next).as_leaf();
-                                if next_leaf.key_count() > 0 {
-                                    return Some((next, 0));
-                                }
-                            }
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
+        let (leaf_handle, leaf, leaf_rank) = self.find_leaf_with_rank(key)?;
+        let idx = match leaf.search(key) {
+            SearchResult::Found(idx) if include_equal => idx + 1,
+            SearchResult::Found(idx) | SearchResult::NotFound(idx) => idx,
+        };
+        Some((leaf_handle, idx, leaf_rank + idx))
     }
 
-    /// Finds the upper bound position (first key > given key).
-    /// Returns (`leaf_handle`, index) or None if all keys are <= the given key.
-    pub(crate) fn upper_bound<Q>(&self, key: &Q) -> Option<(Handle, usize)>
+    /// Returns the first position at or after `idx` in `leaf_handle`, following the leaf chain.
+    fn position_at_or_after(&self, leaf_handle: Handle, idx: usize) -> Option<(Handle, usize)> {
+        let leaf = self.nodes.get(leaf_handle).as_leaf();
+        if idx < leaf.key_count() {
+            return Some((leaf_handle, idx));
+        }
+        let next = leaf.next()?;
+        (self.nodes.get(next).as_leaf().key_count() > 0).then_some((next, 0))
+    }
+
+    /// Returns the last position before `idx` in `leaf_handle`, following the leaf chain.
+    fn position_before(&self, leaf_handle: Handle, idx: usize) -> Option<(Handle, usize)> {
+        if idx > 0 {
+            return Some((leaf_handle, idx - 1));
+        }
+        let prev = self.nodes.get(leaf_handle).as_leaf().prev()?;
+        let count = self.nodes.get(prev).as_leaf().key_count();
+        count.checked_sub(1).map(|last| (prev, last))
+    }
+
+    /// Returns the first position after the split point for `key` (see
+    /// [`Self::split_point`]) and the number of elements before the split.
+    fn first_position_after<Q>(&self, key: &Q, include_equal: bool) -> (Option<(Handle, usize)>, usize)
     where
         K: Borrow<Q>,
         Q: ?Sized + Ord,
     {
-        let root = self.root?;
-        let mut current = root;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(key);
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(leaf) => {
-                    // Find first key > target
-                    match leaf.search(key) {
-                        SearchResult::Found(idx) => {
-                            // Key found, upper bound is the next position
-                            let next_idx = idx + 1;
-                            if next_idx < leaf.key_count() {
-                                return Some((current, next_idx));
-                            }
-                            // Check next leaf
-                            if let Some(next) = leaf.next() {
-                                let next_leaf = self.nodes.get(next).as_leaf();
-                                if next_leaf.key_count() > 0 {
-                                    return Some((next, 0));
-                                }
-                            }
-                            return None;
-                        }
-                        SearchResult::NotFound(idx) => {
-                            // idx is where key would be inserted, so it's also the first key > target
-                            if idx < leaf.key_count() {
-                                return Some((current, idx));
-                            }
-                            // All keys in this leaf are <= target, check next leaf
-                            if let Some(next) = leaf.next() {
-                                let next_leaf = self.nodes.get(next).as_leaf();
-                                if next_leaf.key_count() > 0 {
-                                    return Some((next, 0));
-                                }
-                            }
-                            return None;
-                        }
-                    }
-                }
-            }
+        match self.split_point(key, include_equal) {
+            Some((leaf_handle, idx, rank)) => (self.position_at_or_after(leaf_handle, idx), rank),
+            None => (None, 0),
         }
     }
 
-    /// Finds the last position <= given key.
-    /// Returns (`leaf_handle`, index) or None if all keys are > the given key.
-    pub(crate) fn upper_bound_inclusive<Q>(&self, key: &Q) -> Option<(Handle, usize)>
+    /// Returns the last position before the split point for `key` (see
+    /// [`Self::split_point`]) and the number of elements before the split.
+    fn last_position_before<Q>(&self, key: &Q, include_equal: bool) -> (Option<(Handle, usize)>, usize)
     where
         K: Borrow<Q>,
         Q: ?Sized + Ord,
     {
-        // Find lower_bound and then step back if needed
-        let root = self.root?;
-        let mut current = root;
-
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(key);
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(leaf) => {
-                    match leaf.search(key) {
-                        SearchResult::Found(idx) => return Some((current, idx)),
-                        SearchResult::NotFound(idx) => {
-                            // idx is insertion point; last key <= target is at idx - 1
-                            if idx > 0 {
-                                return Some((current, idx - 1));
-                            }
-                            // Need to check previous leaf
-                            if let Some(prev) = leaf.prev() {
-                                let prev_leaf = self.nodes.get(prev).as_leaf();
-                                if prev_leaf.key_count() > 0 {
-                                    return Some((prev, prev_leaf.key_count() - 1));
-                                }
-                            }
-                            return None;
-                        }
-                    }
-                }
-            }
+        match self.split_point(key, include_equal) {
+            Some((leaf_handle, idx, rank)) => (self.position_before(leaf_handle, idx), rank),
+            None => (None, 0),
         }
     }
 
-    /// Finds the last position < given key.
-    /// Returns (`leaf_handle`, index) or None if all keys are >= the given key.
-    pub(crate) fn lower_bound_exclusive<Q>(&self, key: &Q) -> Option<(Handle, usize)>
+    /// Resolves `range` to the positions of its first and last elements and its length.
+    pub(crate) fn range_cursor<T, R>(&self, range: &R) -> RangeCursor
     where
-        K: Borrow<Q>,
-        Q: ?Sized + Ord,
+        K: Borrow<T>,
+        T: ?Sized + Ord,
+        R: RangeBounds<T>,
     {
-        let root = self.root?;
-        let mut current = root;
+        let (front, start_rank) = match range.start_bound() {
+            Bound::Unbounded => (self.first_position(), 0),
+            Bound::Included(start) => self.first_position_after(start, false),
+            Bound::Excluded(start) => self.first_position_after(start, true),
+        };
+        let (back, end_rank) = match range.end_bound() {
+            Bound::Unbounded => (self.last_position(), self.len),
+            Bound::Included(end) => self.last_position_before(end, true),
+            Bound::Excluded(end) => self.last_position_before(end, false),
+        };
 
-        loop {
-            let node = self.nodes.get(current);
-            match node {
-                Node::Internal(internal) => {
-                    let child_idx = internal.search_child(key);
-                    current = internal.child(child_idx);
-                }
-                Node::Leaf(leaf) => {
-                    match leaf.search(key) {
-                        SearchResult::Found(idx) => {
-                            // Key found, exclusive upper bound is idx - 1
-                            if idx > 0 {
-                                return Some((current, idx - 1));
-                            }
-                            // Need to check previous leaf
-                            if let Some(prev) = leaf.prev() {
-                                let prev_leaf = self.nodes.get(prev).as_leaf();
-                                if prev_leaf.key_count() > 0 {
-                                    return Some((prev, prev_leaf.key_count() - 1));
-                                }
-                            }
-                            return None;
-                        }
-                        SearchResult::NotFound(idx) => {
-                            // idx is insertion point; last key < target is at idx - 1
-                            if idx > 0 {
-                                return Some((current, idx - 1));
-                            }
-                            // Need to check previous leaf
-                            if let Some(prev) = leaf.prev() {
-                                let prev_leaf = self.nodes.get(prev).as_leaf();
-                                if prev_leaf.key_count() > 0 {
-                                    return Some((prev, prev_leaf.key_count() - 1));
-                                }
-                            }
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl<K: Clone, V: Clone> Clone for RawOSBTreeMap<K, V> {
-    fn clone(&self) -> Self {
-        use alloc::collections::VecDeque;
-
-        fn clone_node<K: Clone, V: Clone>(
-            old_nodes: &Arena<Node<K>>,
-            old_values: &Arena<V>,
-            new_nodes: &mut Arena<Node<K>>,
-            new_values: &mut Arena<V>,
-            old_handle: Handle,
-        ) -> Handle {
-            let old_node = old_nodes.get(old_handle);
-            match old_node {
-                Node::Leaf(leaf) => {
-                    let mut new_leaf = LeafNode::new();
-                    for i in 0..leaf.key_count() {
-                        let key = leaf.key(i).clone();
-                        let old_value_handle = leaf.value(i);
-                        let new_value_handle = new_values.alloc(old_values.get(old_value_handle).clone());
-                        new_leaf.push(key, new_value_handle);
-                    }
-                    // prev/next will be fixed up later
-                    new_nodes.alloc(Node::Leaf(new_leaf))
-                }
-                Node::Internal(internal) => {
-                    // Recursively clone children
-                    let mut new_internal = InternalNode::new();
-
-                    // Clone first child
-                    let first_child = internal.child(0);
-                    let new_first = clone_node(old_nodes, old_values, new_nodes, new_values, first_child);
-                    let first_size = internal.child_size(0);
-                    new_internal.set_first_child(new_first, first_size);
-
-                    // Clone remaining children
-                    for i in 0..internal.key_count() {
-                        let key = internal.key(i).clone();
-                        let child = internal.child(i + 1);
-                        let new_child = clone_node(old_nodes, old_values, new_nodes, new_values, child);
-                        let child_size = internal.child_size(i + 1);
-                        new_internal.push_child(key, new_child, child_size);
-                    }
-
-                    new_internal.set_size(internal.size());
-                    new_nodes.alloc(Node::Internal(new_internal))
-                }
-            }
-        }
-
-        fn find_leaves<K>(nodes: &Arena<Node<K>>, root: Handle) -> alloc::vec::Vec<Handle> {
-            let mut leaves = alloc::vec::Vec::new();
-            let mut stack = alloc::vec![root];
-            while let Some(handle) = stack.pop() {
-                match nodes.get(handle) {
-                    Node::Leaf(_) => leaves.push(handle),
-                    Node::Internal(internal) => {
-                        // Push children in reverse order so we process left-to-right
-                        for i in (0..internal.child_count()).rev() {
-                            stack.push(internal.child(i));
-                        }
-                    }
-                }
-            }
-            leaves
-        }
-
-        // Clone values arena
-        let mut new_values: Arena<V> = Arena::with_capacity(self.values.capacity());
-        let mut new_nodes: Arena<Node<K>> = Arena::with_capacity(self.nodes.capacity());
-
-        // If empty, return empty tree
-        if self.root.is_none() {
-            return Self {
-                nodes: new_nodes,
-                values: new_values,
-                root: None,
-                len: 0,
-                first_leaf: None,
-                last_leaf: None,
-            };
-        }
-
-        // Clone all nodes using depth-first traversal
-        let new_root = clone_node(&self.nodes, &self.values, &mut new_nodes, &mut new_values, self.root.unwrap());
-
-        // Fix up leaf prev/next pointers by traversing the leaf chain
-        // Find all leaves and build the chain
-        let new_leaves = find_leaves(&new_nodes, new_root);
-
-        // Set up prev/next links
-        for i in 0..new_leaves.len() {
-            let handle = new_leaves[i];
-            let prev = if i > 0 {
-                Some(new_leaves[i - 1])
-            } else {
-                None
-            };
-            let next = if i < new_leaves.len() - 1 {
-                Some(new_leaves[i + 1])
-            } else {
-                None
-            };
-            let leaf = new_nodes.get_mut(handle).as_leaf_mut();
-            leaf.set_prev(prev);
-            leaf.set_next(next);
-        }
-
-        let first_leaf = new_leaves.first().copied();
-        let last_leaf = new_leaves.last().copied();
-
-        Self {
-            nodes: new_nodes,
-            values: new_values,
-            root: Some(new_root),
-            len: self.len,
-            first_leaf,
-            last_leaf,
+        match (front, back) {
+            (Some((front_leaf, front_index)), Some((back_leaf, back_index))) if end_rank > start_rank => RangeCursor {
+                front_leaf: Some(front_leaf),
+                front_index,
+                back_leaf: Some(back_leaf),
+                back_index,
+                len: end_rank - start_rank,
+            },
+            _ => RangeCursor::default(),
         }
     }
 }
@@ -1470,7 +1095,6 @@ impl<K: Clone, V: Clone> Clone for RawOSBTreeMap<K, V> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(
     clippy::collapsible_if,
-    clippy::manual_assert,
     clippy::uninlined_format_args,
     clippy::stable_sort_primitive,
     clippy::cast_possible_truncation,
@@ -1483,6 +1107,26 @@ mod tests {
     use proptest::prelude::*;
 
     impl<K: Ord + Clone, V> RawOSBTreeMap<K, V> {
+        /// First position with a key >= `key`.
+        fn lower_bound(&self, key: &K) -> Option<(Handle, usize)> {
+            self.first_position_after(key, false).0
+        }
+
+        /// First position with a key > `key`.
+        fn upper_bound(&self, key: &K) -> Option<(Handle, usize)> {
+            self.first_position_after(key, true).0
+        }
+
+        /// Last position with a key <= `key`.
+        fn upper_bound_inclusive(&self, key: &K) -> Option<(Handle, usize)> {
+            self.last_position_before(key, true).0
+        }
+
+        /// Last position with a key < `key`.
+        fn lower_bound_exclusive(&self, key: &K) -> Option<(Handle, usize)> {
+            self.last_position_before(key, false).0
+        }
+
         /// Validates all B+Tree invariants. Panics with a descriptive message if any are violated.
         /// This is intended for use in tests to catch tree corruption.
         pub(crate) fn validate_invariants(&self) {
@@ -1785,6 +1429,28 @@ mod tests {
         }
 
         #[test]
+        fn clone_after_removals_is_compact_and_valid(ops in prop::collection::vec(op_strategy(), 0..500)) {
+            let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+            for op in ops {
+                match op {
+                    Op::Insert(key) => { tree.insert(key, key * 2); }
+                    Op::Remove(key) => { tree.remove(&key); }
+                }
+            }
+
+            let clone = tree.clone();
+            clone.validate_invariants();
+            prop_assert_eq!(clone.len(), tree.len());
+            // Only live entries are copied: no free slots carry over.
+            prop_assert_eq!(clone.values.slot_count(), tree.len());
+            prop_assert_eq!(clone.nodes.slot_count(), clone.nodes.len());
+            prop_assert_eq!(clone.capacity(), tree.capacity());
+            for rank in 0..tree.len() {
+                prop_assert_eq!(clone.get_by_rank(rank), tree.get_by_rank(rank));
+            }
+        }
+
+        #[test]
         fn rank_roundtrip(ops in prop::collection::vec((0i32..500).prop_map(Op::Insert), 1..200)) {
             let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
 
@@ -1937,8 +1603,10 @@ mod tests {
             tree.validate_invariants();
         }
 
-        // Record all (key, rank) pairs
-        let key_ranks: Vec<(i32, usize)> = (0..100).map(|i| (i, tree.rank_of(&i).expect("key should exist"))).collect();
+        // Before removals, each key's rank equals its value.
+        for (expected_rank, key) in (0..100).enumerate() {
+            assert_eq!(tree.rank_of(&key), Some(expected_rank));
+        }
 
         // Remove some elements (this may trigger rebalancing)
         for i in (0..100).step_by(3) {
@@ -2038,11 +1706,11 @@ mod tests {
             node: root,
             child_index: 0,
         });
-        tree.update_separators_after_remove(mid, &synthetic_path);
+        tree.update_separators_after_remove(mid, 0, &synthetic_path);
     }
 
     #[test]
-    fn update_sizes_helpers_cover_leaf_children() {
+    fn refresh_sizes_covers_leaf_children() {
         let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
         for i in 0..64 {
             tree.insert(i, i);
@@ -2062,19 +1730,7 @@ mod tests {
             node: root,
             child_index: 0,
         });
-        tree.update_sizes_along_path(&path);
-
-        // Use a synthetic duplicate-root path to exercise the ancestor recompute leaf branch.
-        let mut duplicate_root_path: Path = SmallVec::new();
-        duplicate_root_path.push(PathElement {
-            node: root,
-            child_index: 0,
-        });
-        duplicate_root_path.push(PathElement {
-            node: root,
-            child_index: 0,
-        });
-        tree.update_sizes_after_remove(first_child, &duplicate_root_path);
+        tree.refresh_sizes(&path);
 
         tree.validate_invariants();
     }
@@ -2305,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "get_by_rank: tree size invariant violated")]
+    #[should_panic(expected = "locate_rank: tree size invariant violated")]
     fn get_by_rank_panics_when_internal_sizes_are_inconsistent() {
         let (mut tree, root_handle, _left, _right) = make_two_leaf_tree(&[0, 2], &[4, 6]);
         {
@@ -2318,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "get_by_rank_mut: tree size invariant violated")]
+    #[should_panic(expected = "locate_rank: tree size invariant violated")]
     fn get_by_rank_mut_panics_when_internal_sizes_are_inconsistent() {
         let (mut tree, root_handle, _left, _right) = make_two_leaf_tree(&[0, 2], &[4, 6]);
         {
