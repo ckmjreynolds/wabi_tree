@@ -7,6 +7,11 @@
     pull_request:
       branches: [main]
 
+  # Least privilege for GITHUB_TOKEN; jobs that need more (audit) widen it themselves.
+  # Publishing and Codecov use their own tokens.
+  permissions:
+    contents: read
+
   env:
     CARGO_TERM_COLOR: always
     RUSTFLAGS: -Dwarnings
@@ -117,6 +122,11 @@
     audit:
       name: Security Audit
       runs-on: ubuntu-latest
+      # audit-check reports via a check run and opens issues for new advisories.
+      permissions:
+        contents: read
+        checks: write
+        issues: write
       steps:
         - uses: actions/checkout@v7
         - uses: rustsec/audit-check@v2

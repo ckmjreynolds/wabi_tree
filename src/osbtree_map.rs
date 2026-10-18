@@ -1939,7 +1939,9 @@ impl<'a, K: 'a, V: 'a> Default for IterMut<'a, K, V> {
     /// ```
     fn default() -> Self {
         IterMut {
-            tree: core::ptr::null_mut(),
+            // SAFETY: tree is never dereferenced when remaining == 0 and front_leaf/back_leaf
+            // are None, so a dangling pointer is safe here.
+            tree: core::ptr::NonNull::dangling().as_ptr(),
             front_leaf: None,
             front_index: 0,
             back_leaf: None,
@@ -2572,7 +2574,8 @@ impl<K, V> Default for RangeMut<'_, K, V> {
     /// ```
     fn default() -> Self {
         RangeMut {
-            tree: core::ptr::null_mut(),
+            // SAFETY: tree is never dereferenced when finished == true and leaves are None.
+            tree: core::ptr::NonNull::dangling().as_ptr(),
             front_leaf: None,
             front_index: 0,
             back_leaf: None,
