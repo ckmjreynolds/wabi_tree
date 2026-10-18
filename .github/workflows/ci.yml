@@ -17,7 +17,7 @@
       name: Rustfmt
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v6
+        - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@stable
           with:
             components: rustfmt
@@ -28,7 +28,7 @@
       name: Clippy
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v6
+        - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@stable
           with:
             components: clippy
@@ -42,7 +42,7 @@
       env:
         RUSTDOCFLAGS: -Dwarnings
       steps:
-        - uses: actions/checkout@v6
+        - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@stable
         - uses: Swatinem/rust-cache@v2
         - run: cargo doc --no-deps --all-features
@@ -59,9 +59,9 @@
           include:
             # MSRV check on Linux only
             - os: ubuntu-latest
-              rust: "1.87"
+              rust: "1.88"
       steps:
-        - uses: actions/checkout@v6
+        - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@master
           with:
             toolchain: ${{ matrix.rust }}
@@ -75,7 +75,7 @@
       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v6
+        - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@stable
           with:
             components: llvm-tools-preview
@@ -84,7 +84,7 @@
         - name: Generate coverage
           run: cargo +nightly llvm-cov --all-features --doctests --branch --lcov --output-path lcov.info
         - name: Upload to Codecov
-          uses: codecov/codecov-action@v5
+          uses: codecov/codecov-action@v7
           with:
             token: ${{ secrets.CODECOV_TOKEN }}
             files: lcov.info
@@ -95,7 +95,7 @@
       name: Security Audit
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v6
+        - uses: actions/checkout@v7
         - uses: rustsec/audit-check@v2
           with:
             token: ${{ secrets.GITHUB_TOKEN }}
@@ -107,7 +107,7 @@
       if: startsWith(github.ref, 'refs/tags/v')
       runs-on: ubuntu-latest
       steps:
-        - uses: actions/checkout@v6
+        - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@stable
         - uses: Swatinem/rust-cache@v2
         - name: Publish to crates.io
