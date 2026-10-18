@@ -59,7 +59,7 @@
           include:
             # MSRV check on Linux only
             - os: ubuntu-latest
-              rust: "1.87"
+              rust: "1.88"
       steps:
         - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@master
