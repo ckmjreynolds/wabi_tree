@@ -1118,7 +1118,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                     // - These arenas are disjoint memory regions
                     // - We only mutate `self.values`, never `self.nodes`
                     // - The key reference remains valid because we don't modify the nodes arena
-                    let key_ptr = key as *const K;
+                    let key_ptr = core::ptr::from_ref::<K>(key);
                     let value = self.values.get_mut(value_handle);
                     return Some((unsafe { &*key_ptr }, value));
                 }

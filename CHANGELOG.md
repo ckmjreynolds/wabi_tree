@@ -6,6 +6,16 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+### Changed
+- Relax exact (`=`) dependency pins to caret requirements so downstream crates can resolve compatible versions.
+- Bump `smallvec` dependency from 1.15.1 to 1.16.3.
+- Bump `proptest` dev-dependency from 1.10.0 to 1.11.0 (1.12 requires Rust 1.88, above the 1.87 MSRV).
+- Refresh `Cargo.lock` to the latest compatible versions.
+- Fix new Clippy 1.99 lints (`ref_as_ptr`, `for_kv_map`).
+
+### CI
+- Update GitHub Actions dependencies (actions/checkout v7, codecov-action v7).
+
 ## [0.1.2] - 2026-02-10
 
 ### Changed

@@ -746,7 +746,7 @@ proptest! {
         for (_, v) in os_map.iter_mut() {
             *v = v.wrapping_add(1);
         }
-        for (_, v) in bt_map.iter_mut() {
+        for v in bt_map.values_mut() {
             *v = v.wrapping_add(1);
         }
 
