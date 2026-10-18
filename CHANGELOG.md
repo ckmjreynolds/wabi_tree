@@ -6,16 +6,39 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-18
+
+### Fixed
+- Undefined behavior (under the Stacked Borrows model) when holding several `&mut V` references
+  from `iter_mut`, `values_mut`, or `range_mut` at once, e.g. after `.collect()`.
+- If a key's `Clone` panicked while an insert or remove was rebalancing the tree, entries could
+  be silently lost and `len()` would disagree with iteration. The tree now stays consistent.
+- `get_by_rank`, `get_by_rank_mut`, and `Index<Rank>` could hang in release builds if the tree's
+  internal sizes were inconsistent. They now panic instead.
+
 ### Changed
-- Relax exact (`=`) dependency pins to caret requirements so downstream crates can resolve compatible versions.
-- Bump `smallvec` dependency from 1.15.1 to 1.16.3.
-- Bump `proptest` dev-dependency from 1.10.0 to 1.12.0.
-- Raise MSRV from 1.87 to 1.88 (required by `proptest` 1.12).
-- Refresh `Cargo.lock` to the latest compatible versions.
-- Fix new Clippy 1.99 lints (`ref_as_ptr`, `for_kv_map`).
+- Minimum supported Rust version is now 1.88.
+- Dependencies are no longer pinned to exact versions, so `wabi_tree` resolves alongside other
+  crates that use `smallvec` without version conflicts.
+- Removed the `static_assertions` dependency.
+- Updated `smallvec` to 1.16.3.
+
+### Performance
+- Removing elements (`remove`, `pop_first`, `pop_last`, and the `OSBTreeSet` equivalents) is
+  about 8–20% faster.
+- `entry(key).or_insert(..)` and related methods no longer clone the key or search the tree twice
+  when the key is missing.
+- Creating a `range`/`range_mut` iterator does half as many tree lookups.
+- `OSBTreeSet::is_disjoint` returns immediately when the two sets' ranges don't overlap.
+
+### Internal
+- Simplified and deduplicated internal tree code and removed dead code.
+- Updated dev-dependencies and GitHub Actions, and fixed new Clippy lints.
 
 ### CI
-- Update GitHub Actions dependencies (actions/checkout v7, codecov-action v7).
+- New Miri job checks the `unsafe` code paths under both Stacked Borrows and Tree Borrows.
+- The test suite also runs in release mode.
+- Coverage and Miri use a pinned nightly toolchain, so a nightly regression can't break CI.
 
 ## [0.1.2] - 2026-02-10
 

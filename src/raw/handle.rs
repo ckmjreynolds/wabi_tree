@@ -16,7 +16,6 @@ impl Handle {
     pub(crate) const fn from_index(index: usize) -> Self {
         assert!(index <= Self::MAX, "`Handle::from_index()` - `index` > `Handle::MAX`!");
         // SAFETY: `index + 1` cannot be zero and cannot overflow.
-        #[allow(clippy::cast_possible_truncation)]
         Self(NonZero::new((index + 1) as RawHandle).unwrap())
     }
 
@@ -31,11 +30,9 @@ impl Handle {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use static_assertions::assert_eq_size;
-
     // Verify our assumptions about `Handle` and the niche optimization.
-    assert_eq_size!(Handle, Option<Handle>);
-    assert_eq_size!(Handle, RawHandle);
+    const _: () = assert!(size_of::<Handle>() == size_of::<Option<Handle>>());
+    const _: () = assert!(size_of::<Handle>() == size_of::<RawHandle>());
 
     #[test]
     #[should_panic(expected = "`Handle::from_index()` - `index` > `Handle::MAX`!")]

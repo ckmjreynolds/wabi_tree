@@ -59,10 +59,6 @@
 #![warn(clippy::pedantic)]
 // Enable coverage attributes for nightly builds.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-// Allow unused code during initial development.
-#![allow(unused)]
-// Allow todo!() placeholders during API scaffolding.
-#![allow(clippy::todo)]
 
 extern crate alloc;
 

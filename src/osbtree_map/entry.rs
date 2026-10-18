@@ -199,7 +199,6 @@ impl<'a, K: Ord + Clone, V> Entry<'a, K, V> {
     /// # Complexity
     ///
     /// O(1)
-    #[allow(clippy::must_use_candidate)]
     pub fn key(&self) -> &K {
         match self {
             Entry::Occupied(o) => o.key(),
@@ -287,7 +286,6 @@ impl<'a, K: Ord + Clone, V: Default> Entry<'a, K, V> {
     /// # Complexity
     ///
     /// O(log n) if vacant (insertion), O(1) if occupied.
-    #[allow(clippy::must_use_candidate)]
     pub fn or_default(self) -> &'a mut V {
         match self {
             Entry::Occupied(o) => o.into_mut(),
@@ -312,7 +310,6 @@ impl<'a, K: Ord + Clone, V> VacantEntry<'a, K, V> {
     /// # Complexity
     ///
     /// O(1)
-    #[allow(clippy::must_use_candidate)]
     pub fn key(&self) -> &K {
         &self.key
     }
@@ -335,17 +332,12 @@ impl<'a, K: Ord + Clone, V> VacantEntry<'a, K, V> {
     /// # Complexity
     ///
     /// O(1)
-    #[allow(clippy::must_use_candidate)]
     pub fn into_key(self) -> K {
         self.key
     }
 
     /// Sets the value of the entry with the `VacantEntry`'s key,
     /// and returns a mutable reference to it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tree's internal state is corrupted (should never happen in normal use).
     ///
     /// # Examples
     ///
@@ -365,11 +357,8 @@ impl<'a, K: Ord + Clone, V> VacantEntry<'a, K, V> {
     ///
     /// O(log n)
     pub fn insert(self, value: V) -> &'a mut V {
-        let key = self.key.clone();
-        self.tree.insert(self.key, value);
-        // Get a mutable reference to the inserted value
-        // SAFETY: We know the key exists because we just inserted it
-        self.tree.get_mut(&key).expect("just inserted")
+        let (value_handle, _) = self.tree.insert_with_handle(self.key, value);
+        self.tree.value_mut(value_handle)
     }
 
     /// Sets the value of the entry with the `VacantEntry`'s key,
@@ -463,7 +452,6 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     /// # Complexity
     ///
     /// O(log n)
-    #[allow(clippy::must_use_candidate)]
     pub fn remove_entry(self) -> (K, V) {
         self.tree.remove_entry(&self.key).expect("entry must exist")
     }
@@ -608,7 +596,6 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     /// # Complexity
     ///
     /// O(log n)
-    #[allow(clippy::must_use_candidate)]
     pub fn remove(self) -> V {
         self.remove_entry().1
     }
