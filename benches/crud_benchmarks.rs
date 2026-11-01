@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::collections::{BTreeMap, BTreeSet};
 use wabi_tree::{OSBTreeMap, OSBTreeSet};
 
@@ -671,6 +671,68 @@ fn bench_set_collect(c: &mut Criterion) {
     }
 }
 
+// ─── split_off / append ─────────────────────────────────────────────────────
+
+fn bench_map_split_off(c: &mut Criterion) {
+    let os: OSBTreeMap<i64, i64> = (0..N as i64).map(|k| (k, k)).collect();
+    let bt: BTreeMap<i64, i64> = (0..N as i64).map(|k| (k, k)).collect();
+    for percent in [1, 50, 99] {
+        let at = (N * percent / 100) as i64;
+        let mut group = c.benchmark_group(format!("map_split_off_{percent}pct"));
+        group.bench_function(BenchmarkId::new("OSBTreeMap", N), |b| {
+            b.iter_batched(|| os.clone(), |mut m| (m.split_off(&at), m), BatchSize::LargeInput);
+        });
+        group.bench_function(BenchmarkId::new("BTreeMap", N), |b| {
+            b.iter_batched(|| bt.clone(), |mut m| (m.split_off(&at), m), BatchSize::LargeInput);
+        });
+        group.finish();
+    }
+}
+
+/// `(self, other)` key sets for each `append` case.
+fn append_cases() -> [(&'static str, Vec<i64>, Vec<i64>); 3] {
+    let half = N as i64 / 2;
+    [
+        // `other` lies entirely after `self`.
+        ("disjoint", (0..half).collect(), (half..N as i64).collect()),
+        // Interleaved keys, similar sizes.
+        ("interleaved", (0..half).map(|k| k * 2).collect(), (0..half).map(|k| k * 2 + 1).collect()),
+        // A few keys scattered through a large map.
+        ("small_other", (0..N as i64).map(|k| k * 2).collect(), (0..50).map(|k| k * 400 + 1).collect()),
+    ]
+}
+
+fn bench_map_append(c: &mut Criterion) {
+    for (case, a, b_keys) in append_cases() {
+        let os_a: OSBTreeMap<i64, i64> = a.iter().map(|&k| (k, k)).collect();
+        let os_b: OSBTreeMap<i64, i64> = b_keys.iter().map(|&k| (k, k)).collect();
+        let bt_a: BTreeMap<i64, i64> = a.iter().map(|&k| (k, k)).collect();
+        let bt_b: BTreeMap<i64, i64> = b_keys.iter().map(|&k| (k, k)).collect();
+        let mut group = c.benchmark_group(format!("map_append_{case}"));
+        group.bench_function(BenchmarkId::new("OSBTreeMap", N), |b| {
+            b.iter_batched(
+                || (os_a.clone(), os_b.clone()),
+                |(mut x, mut y)| {
+                    x.append(&mut y);
+                    x
+                },
+                BatchSize::LargeInput,
+            );
+        });
+        group.bench_function(BenchmarkId::new("BTreeMap", N), |b| {
+            b.iter_batched(
+                || (bt_a.clone(), bt_b.clone()),
+                |(mut x, mut y)| {
+                    x.append(&mut y);
+                    x
+                },
+                BatchSize::LargeInput,
+            );
+        });
+        group.finish();
+    }
+}
+
 // ─── Criterion Groups ───────────────────────────────────────────────────────
 
 criterion_group!(map_insert_benches, bench_map_insert_ordered, bench_map_insert_reverse, bench_map_insert_random,);
@@ -694,6 +756,8 @@ criterion_group!(set_relation_benches, bench_set_is_subset);
 
 criterion_group!(collect_benches, bench_map_collect, bench_set_collect);
 
+criterion_group!(split_append_benches, bench_map_split_off, bench_map_append);
+
 criterion_main!(
     map_insert_benches,
     map_get_benches,
@@ -703,4 +767,5 @@ criterion_main!(
     set_remove_benches,
     set_relation_benches,
     collect_benches,
+    split_append_benches,
 );
