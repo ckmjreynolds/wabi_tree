@@ -6,6 +6,8 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-01
+
 ### Changed
 - When `collect`, `from_iter` or `From<[_; N]>` meets equal keys, it now keeps the last one, key
   and value both, as `BTreeMap` and `BTreeSet` do. Previously the map kept the first key with the
@@ -103,3 +105,11 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ### Added
 - Initial public release of `OSBTreeMap` and `OSBTreeSet` with rank operations.
+
+[Unreleased]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/ckmjreynolds/wabi_tree/releases/tag/v0.1.0

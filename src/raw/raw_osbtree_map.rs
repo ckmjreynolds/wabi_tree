@@ -44,23 +44,32 @@ pub(crate) struct RangeCursor {
     pub(crate) start_rank: usize,
 }
 
-/// One level of a [`Finger`]: a node and the ranks `start..end` held in its subtree.
+/// One level of a [`Finger`]: a node and the ranks `start_rank..end_rank` held in its subtree.
 #[derive(Clone, Copy)]
 struct FingerLevel {
     node: Handle,
-    start: usize,
-    end: usize,
+    start_rank: usize,
+    end_rank: usize,
 }
 
-/// The path from the root to the node an iterator last jumped to, with each level's rank range.
-/// [`RawOSBTreeMap::seek`] climbs it only as far as a jump needs instead of restarting at the
-/// root. A [`Span`] allocates its fingers on its first long jump, so plain iteration never pays
-/// for them. Inner nodes have at least `MIN_CHILDREN` (64) children, so eight levels cover any
-/// tree that fits in memory and the levels live inside that one allocation.
+/// The path from the root to the node an iterator's last long jump reached, with each level's
+/// rank range. [`RawOSBTreeMap::seek`] climbs it only as far as a jump needs instead of
+/// restarting at the root. A [`Span`] allocates its fingers on its first long jump, so plain
+/// iteration never pays for them. Inner nodes have at least `MIN_CHILDREN` (64) children, so
+/// eight levels cover any tree that fits in memory and the levels live inside that one
+/// allocation.
+///
+/// A finger records where the last long jump landed, not the iterator's current position:
+/// `next`, `next_back` and short jumps move the iterator without touching it, so it can be left
+/// behind, even under a different parent. That is harmless. Each level's rank range describes
+/// the tree, which cannot change while the iterator exists, so the levels stay a true path from
+/// the root with correct ranges. `seek` climbs by rank range rather than from the current leaf,
+/// so a finger left behind only makes the next long jump climb higher, and that cost was
+/// already paid by the steps that left it behind.
 type Finger = SmallVec<[FingerLevel; 8]>;
 
-/// The two fingers of a [`Span`], one per end. Boxed so that a span that never makes a long
-/// jump pays only for a null pointer.
+/// The two fingers of a [`Span`], one per end. `Span` holds them as `Option<Box<Fingers>>`, so a
+/// span that never makes a long jump pays only for a null pointer.
 #[derive(Default)]
 struct Fingers {
     front: Finger,
@@ -428,6 +437,8 @@ impl<K, V> RawOSBTreeMap<K, V> {
     /// on the new path. A long jump reads O(1 + log d) nodes, where `d` is the distance from the
     /// previous long jump's target (the steps in between were each paid for by `next` or a
     /// short jump), so a whole pass over an iterator stays O(n) however it is split into jumps.
+    /// The finger is not updated by those steps, so it may be behind `(leaf, index)`; see
+    /// [`Finger`] for why that is safe.
     ///
     /// # Safety
     /// - `ptr` must point to a valid, allocated `RawOSBTreeMap<K, V>`.
@@ -483,7 +494,7 @@ impl<K, V> RawOSBTreeMap<K, V> {
 
         // Long jump: climb the finger to the lowest node containing `target`, then descend.
         let finger = which(fingers.get_or_insert_default());
-        while finger.last().is_some_and(|level| !(level.start..level.end).contains(&target)) {
+        while finger.last().is_some_and(|level| !(level.start_rank..level.end_rank).contains(&target)) {
             finger.pop();
         }
         let mut level = if let Some(&level) = finger.last() {
@@ -493,23 +504,23 @@ impl<K, V> RawOSBTreeMap<K, V> {
             let len = unsafe { core::ptr::addr_of!((*ptr).len).read() };
             let level = FingerLevel {
                 node: root.expect("seek: tree is empty"),
-                start: 0,
-                end: len,
+                start_rank: 0,
+                end_rank: len,
             };
             finger.push(level);
             level
         };
         loop {
             match unsafe { Self::node_ptr(ptr, level.node) } {
-                Node::Leaf(_) => return (level.node, target - level.start),
+                Node::Leaf(_) => return (level.node, target - level.start_rank),
                 Node::Internal(internal) => {
-                    let (child, before) =
-                        child_for_rank(internal, target - level.start).expect("seek: tree size invariant violated");
-                    let start = level.start + before;
+                    let (child, before) = child_for_rank(internal, target - level.start_rank)
+                        .expect("seek: tree size invariant violated");
+                    let start_rank = level.start_rank + before;
                     level = FingerLevel {
                         node: internal.child(child),
-                        start,
-                        end: start + internal.child_size(child).to_usize(),
+                        start_rank,
+                        end_rank: start_rank + internal.child_size(child).to_usize(),
                     };
                     finger.push(level);
                 }
