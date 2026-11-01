@@ -244,14 +244,32 @@ impl<K, V> RawOSBTreeMap<K, V> {
 
     /// Creates a new tree with the specified capacity.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::with_arena_capacities(capacity.div_ceil(MAX_KEYS), capacity)
+    }
+
+    /// Creates an empty tree whose arenas have room for `nodes` nodes and `values` values.
+    fn with_arena_capacities(nodes: usize, values: usize) -> Self {
         Self {
-            nodes: Arena::with_capacity(capacity.div_ceil(MAX_KEYS)),
-            values: Arena::with_capacity(capacity),
+            nodes: Arena::with_capacity(nodes),
+            values: Arena::with_capacity(values),
             root: None,
             len: 0,
             first_leaf: None,
             last_leaf: None,
         }
+    }
+
+    /// Allocates `leaf` and links it after `last_leaf`, making it the new last leaf. Returns its
+    /// handle. Used when building a tree's leaves left to right.
+    fn push_leaf(&mut self, mut leaf: LeafNode<K>) -> Handle {
+        leaf.set_prev(self.last_leaf);
+        let handle = self.nodes.alloc(Node::Leaf(leaf));
+        match self.last_leaf {
+            Some(prev) => self.nodes.get_mut(prev).as_leaf_mut().set_next(Some(handle)),
+            None => self.first_leaf = Some(handle),
+        }
+        self.last_leaf = Some(handle);
+        handle
     }
 
     /// Returns the number of key-value pairs in the tree.
@@ -519,14 +537,7 @@ impl<K: Clone, V: Clone> Clone for RawOSBTreeMap<K, V> {
                         let value_handle = out.values.alloc(src.values.get(leaf.value(i)).clone());
                         new_leaf.push(leaf.key(i).clone(), value_handle);
                     }
-                    new_leaf.set_prev(out.last_leaf);
-                    let new_handle = out.nodes.alloc(Node::Leaf(new_leaf));
-                    match out.last_leaf {
-                        Some(prev) => out.nodes.get_mut(prev).as_leaf_mut().set_next(Some(new_handle)),
-                        None => out.first_leaf = Some(new_handle),
-                    }
-                    out.last_leaf = Some(new_handle);
-                    new_handle
+                    out.push_leaf(new_leaf)
                 }
                 Node::Internal(internal) => {
                     let mut new_internal = InternalNode::new();
@@ -542,14 +553,8 @@ impl<K: Clone, V: Clone> Clone for RawOSBTreeMap<K, V> {
             }
         }
 
-        let mut out = Self {
-            nodes: Arena::with_capacity(self.nodes.capacity()),
-            values: Arena::with_capacity(self.values.capacity()),
-            root: None,
-            len: self.len,
-            first_leaf: None,
-            last_leaf: None,
-        };
+        let mut out = Self::with_arena_capacities(self.nodes.capacity(), self.values.capacity());
+        out.len = self.len;
         if let Some(root) = self.root {
             out.root = Some(clone_node(self, &mut out, root));
         }
@@ -590,14 +595,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             node_count += level_count;
         }
 
-        let mut tree = Self {
-            nodes: Arena::with_capacity(node_count),
-            values: Arena::with_capacity(len),
-            root: None,
-            len: 0,
-            first_leaf: None,
-            last_leaf: None,
-        };
+        let mut tree = Self::with_arena_capacities(node_count, len);
 
         // Each node on the level being built: (handle, subtree size, rightmost leaf). The
         // rightmost leaf's last key is the node's max key, which is its separator in the parent.
@@ -615,13 +613,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 let value_handle = tree.values.alloc(value);
                 leaf.push(key, value_handle);
             }
-            leaf.set_prev(tree.last_leaf);
-            let handle = tree.nodes.alloc(Node::Leaf(leaf));
-            match tree.last_leaf {
-                Some(prev) => tree.nodes.get_mut(prev).as_leaf_mut().set_next(Some(handle)),
-                None => tree.first_leaf = Some(handle),
-            }
-            tree.last_leaf = Some(handle);
+            let handle = tree.push_leaf(leaf);
             level.push((handle, count, handle));
         }
         debug_assert!(entries.next().is_none(), "`from_sorted_iter()` - more entries than `len()`");
@@ -629,23 +621,27 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         while level.len() > 1 {
             let parent_count = level.len().div_ceil(MAX_CHILDREN);
             let mut parents = alloc::vec::Vec::with_capacity(parent_count);
-            let mut children = level.iter().copied();
+            let mut rest = level.as_slice();
             for count in even_split(level.len(), parent_count) {
+                let (group, tail) = rest.split_at(count);
+                rest = tail;
                 let mut node = InternalNode::new();
-                let (first, first_size, mut rightmost) = children.next().expect("`even_split` counts sum to the level");
+                let (first, first_size, _) = group[0];
                 node.set_first_child(first, Size::from_usize(first_size));
-                let mut size = first_size;
-                for _ in 1..count {
-                    let (child, child_size, child_rightmost) =
-                        children.next().expect("`even_split` counts sum to the level");
-                    let separator =
-                        tree.nodes.get(rightmost).as_leaf().last_key().expect("built leaves are non-empty").clone();
+                for pair in group.windows(2) {
+                    let ((_, _, left_rightmost), (child, child_size, _)) = (pair[0], pair[1]);
+                    let separator = tree
+                        .nodes
+                        .get(left_rightmost)
+                        .as_leaf()
+                        .last_key()
+                        .expect("built leaves are non-empty")
+                        .clone();
                     node.push_child(separator, child, Size::from_usize(child_size));
-                    size += child_size;
-                    rightmost = child_rightmost;
                 }
+                let size = group.iter().map(|&(_, size, _)| size).sum();
                 node.set_size(Size::from_usize(size));
-                parents.push((tree.nodes.alloc(Node::Internal(node)), size, rightmost));
+                parents.push((tree.nodes.alloc(Node::Internal(node)), size, group[count - 1].2));
             }
             level = parents;
         }
@@ -2086,6 +2082,17 @@ mod tests {
         tree.validate_invariants();
     }
 
+    /// The tree's leaves, first to last, by walking the leaf chain.
+    fn leaf_chain<K, V>(tree: &RawOSBTreeMap<K, V>) -> Vec<Handle> {
+        let mut leaves = Vec::new();
+        let mut current = tree.first_leaf();
+        while let Some(handle) = current {
+            leaves.push(handle);
+            current = tree.node(handle).as_leaf().next();
+        }
+        leaves
+    }
+
     #[test]
     fn empty_leaf_neighbors_cause_bounds_to_return_none() {
         let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
@@ -2095,17 +2102,7 @@ mod tests {
         }
         tree.validate_invariants();
 
-        // Collect the leaf chain.
-        let mut leaves: Vec<Handle> = Vec::new();
-        let mut current = tree.first_leaf().expect("non-empty tree has a first leaf");
-        loop {
-            leaves.push(current);
-            let leaf = tree.node(current).as_leaf();
-            match leaf.next() {
-                Some(next) => current = next,
-                None => break,
-            }
-        }
+        let leaves = leaf_chain(&tree);
         assert!(leaves.len() >= 5, "expected multiple leaves");
 
         let mid_index = leaves.len() / 2;
@@ -2454,19 +2451,13 @@ mod tests {
 
     // ─── Bulk construction ──────────────────────────────────────────────────
 
-    /// A tree built from `n` entries with keys `0, 2, 4, ...` and values equal to their rank.
-    fn sorted_tree(n: usize) -> RawOSBTreeMap<i32, usize> {
-        RawOSBTreeMap::from_sorted_iter((0..n).map(|rank| (i32::try_from(rank * 2).unwrap(), rank)))
+    /// `n` entries with keys `0, 2, 4, ...` and values equal to their rank.
+    fn sorted_entries(n: usize) -> impl ExactSizeIterator<Item = (i32, usize)> {
+        (0..n).map(|rank| (i32::try_from(rank * 2).unwrap(), rank))
     }
 
-    fn leaf_chain_len<K, V>(tree: &RawOSBTreeMap<K, V>) -> usize {
-        let mut count = 0;
-        let mut current = tree.first_leaf();
-        while let Some(handle) = current {
-            count += 1;
-            current = tree.node(handle).as_leaf().next();
-        }
-        count
+    fn sorted_tree(n: usize) -> RawOSBTreeMap<i32, usize> {
+        RawOSBTreeMap::from_sorted_iter(sorted_entries(n))
     }
 
     #[test]
@@ -2478,14 +2469,10 @@ mod tests {
             tree.validate_invariants();
             assert_eq!(tree.len(), n);
             // As few leaves as fit, not the half-full leaves that sorted inserts leave behind.
-            assert_eq!(leaf_chain_len(&tree), n.div_ceil(MAX_KEYS), "n = {n}");
+            assert_eq!(leaf_chain(&tree).len(), n.div_ceil(MAX_KEYS), "n = {n}");
             assert_eq!(tree.first_key_value().map(|(&k, &v)| (k, v)), (n > 0).then_some((0, 0)));
-            assert_eq!(
-                tree.last_key_value().map(|(&k, &v)| (k, v)),
-                n.checked_sub(1).map(|last| (i32::try_from(last * 2).unwrap(), last))
-            );
-            for rank in 0..n {
-                let key = i32::try_from(rank * 2).unwrap();
+            assert_eq!(tree.last_key_value().map(|(&k, &v)| (k, v)), sorted_entries(n).last());
+            for (key, rank) in sorted_entries(n) {
                 assert_eq!(tree.get_by_rank(rank).map(|(&k, &v)| (k, v)), Some((key, rank)));
                 assert_eq!(tree.rank_of(&key), Some(rank));
                 assert_eq!(tree.get(&key), Some(&rank));
@@ -2515,8 +2502,7 @@ mod tests {
             ops in prop::collection::vec(op_strategy(), 0..300),
         ) {
             let mut tree = sorted_tree(n);
-            let mut model: alloc::collections::BTreeMap<i32, usize> =
-                (0..n).map(|rank| (i32::try_from(rank * 2).unwrap(), rank)).collect();
+            let mut model: alloc::collections::BTreeMap<i32, usize> = sorted_entries(n).collect();
             for op in ops {
                 match op {
                     Op::Insert(key) => {

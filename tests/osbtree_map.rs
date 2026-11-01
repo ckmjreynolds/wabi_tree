@@ -2022,6 +2022,28 @@ mod drop_tests {
         drop(last);
         assert_eq!(drop_count.get(), 2, "value dropped after pop_last");
     }
+
+    #[test]
+    fn panicking_key_clone_during_collect_drops_every_entry_once() {
+        let drop_count = Rc::new(Cell::new(0));
+        // Enough entries for several leaves, so building the internal level clones separators.
+        let entries: Vec<_> =
+            (0..2_000u32).rev().map(|i| (super::PanickyKey(i), Droppable::new(i.into(), drop_count.clone()))).collect();
+        assert!(super::with_panicking_clone(|| {
+            let _map: OSBTreeMap<_, _> = entries.into_iter().collect();
+        }));
+        assert_eq!(drop_count.get(), 2_000);
+    }
+
+    #[test]
+    fn collect_drops_discarded_duplicates_once() {
+        let drop_count = Rc::new(Cell::new(0));
+        let map: OSBTreeMap<_, _> = (0..3_000).map(|i| (i % 1_000, Droppable::new(i, drop_count.clone()))).collect();
+        assert_eq!(map.len(), 1_000);
+        assert_eq!(drop_count.get(), 2_000);
+        drop(map);
+        assert_eq!(drop_count.get(), 3_000);
+    }
 }
 
 // ─── Zero-Sized Type (ZST) Tests ──────────────────────────────────────────────
@@ -3123,20 +3145,16 @@ impl Ord for Tagged {
     }
 }
 
+const fn tagged(key: u8, tag: usize) -> Tagged {
+    Tagged {
+        key,
+        tag,
+    }
+}
+
 /// Tags each key with its position in `keys`, and pairs it with an arbitrary value.
 fn tagged_entries(keys: &[u8]) -> Vec<(Tagged, usize)> {
-    keys.iter()
-        .enumerate()
-        .map(|(tag, &key)| {
-            (
-                Tagged {
-                    key,
-                    tag,
-                },
-                tag * 10,
-            )
-        })
-        .collect()
+    keys.iter().enumerate().map(|(tag, &key)| (tagged(key, tag), tag * 10)).collect()
 }
 
 fn assert_collect_matches_btreemap(entries: &[(Tagged, usize)]) {
@@ -3192,29 +3210,7 @@ proptest! {
 
 #[test]
 fn from_array_keeps_last_duplicate() {
-    let map = OSBTreeMap::from([
-        (
-            Tagged {
-                key: 2,
-                tag: 0,
-            },
-            "a",
-        ),
-        (
-            Tagged {
-                key: 1,
-                tag: 1,
-            },
-            "b",
-        ),
-        (
-            Tagged {
-                key: 2,
-                tag: 2,
-            },
-            "c",
-        ),
-    ]);
+    let map = OSBTreeMap::from([(tagged(2, 0), "a"), (tagged(1, 1), "b"), (tagged(2, 2), "c")]);
     let items: Vec<_> = map.iter().map(|(k, &v)| (k.key, k.tag, v)).collect();
     assert_eq!(items, [(1, 1, "b"), (2, 2, "c")]);
 }
@@ -3223,52 +3219,7 @@ fn from_array_keeps_last_duplicate() {
 fn extend_still_keeps_first_key_and_last_value() {
     // Unlike `collect`, `extend` goes through `insert`, which keeps the existing key.
     let mut map = OSBTreeMap::new();
-    map.extend([
-        (
-            Tagged {
-                key: 1,
-                tag: 0,
-            },
-            "a",
-        ),
-        (
-            Tagged {
-                key: 1,
-                tag: 1,
-            },
-            "b",
-        ),
-    ]);
+    map.extend([(tagged(1, 0), "a"), (tagged(1, 1), "b")]);
     let items: Vec<_> = map.iter().map(|(k, &v)| (k.key, k.tag, v)).collect();
     assert_eq!(items, [(1, 0, "b")]);
-}
-
-/// A value that counts its drops.
-struct DropCounter(std::rc::Rc<std::cell::Cell<usize>>);
-
-impl Drop for DropCounter {
-    fn drop(&mut self) {
-        self.0.set(self.0.get() + 1);
-    }
-}
-
-#[test]
-fn panicking_key_clone_during_collect_drops_every_entry_once() {
-    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-    // Enough entries for several leaves, so building the internal level clones separators.
-    let entries: Vec<_> = (0..2_000u32).rev().map(|i| (PanickyKey(i), DropCounter(drops.clone()))).collect();
-    assert!(with_panicking_clone(|| {
-        let _map: OSBTreeMap<_, _> = entries.into_iter().collect();
-    }));
-    assert_eq!(drops.get(), 2_000);
-}
-
-#[test]
-fn collect_drops_discarded_duplicates_once() {
-    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-    let map: OSBTreeMap<_, _> = (0..3_000u32).map(|i| (i % 1_000, DropCounter(drops.clone()))).collect();
-    assert_eq!(map.len(), 1_000);
-    assert_eq!(drops.get(), 2_000);
-    drop(map);
-    assert_eq!(drops.get(), 3_000);
 }

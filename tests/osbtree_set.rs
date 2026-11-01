@@ -1790,6 +1790,13 @@ impl Ord for Tagged {
     }
 }
 
+const fn tagged(key: u8, tag: usize) -> Tagged {
+    Tagged {
+        key,
+        tag,
+    }
+}
+
 fn assert_collect_matches_btreeset(values: &[Tagged]) {
     let os_set: OSBTreeSet<Tagged> = values.iter().copied().collect();
     let bt_set: BTreeSet<Tagged> = values.iter().copied().collect();
@@ -1804,7 +1811,7 @@ proptest! {
     /// Like `BTreeSet`, `collect` keeps the last of each run of equal elements.
     #[test]
     fn from_iter_keeps_last_duplicate_like_btreeset(keys in proptest::collection::vec(any::<u8>(), 0..2_000)) {
-        let values: Vec<Tagged> = keys.iter().enumerate().map(|(tag, &key)| Tagged { key, tag }).collect();
+        let values: Vec<Tagged> = keys.iter().enumerate().map(|(tag, &key)| tagged(key, tag)).collect();
         assert_collect_matches_btreeset(&values);
 
         let mut sorted = values.clone();
@@ -1818,20 +1825,7 @@ proptest! {
 
 #[test]
 fn from_array_keeps_last_duplicate() {
-    let set = OSBTreeSet::from([
-        Tagged {
-            key: 2,
-            tag: 0,
-        },
-        Tagged {
-            key: 1,
-            tag: 1,
-        },
-        Tagged {
-            key: 2,
-            tag: 2,
-        },
-    ]);
+    let set = OSBTreeSet::from([tagged(2, 0), tagged(1, 1), tagged(2, 2)]);
     let items: Vec<_> = set.iter().map(|t| (t.key, t.tag)).collect();
     assert_eq!(items, [(1, 1), (2, 2)]);
 }
