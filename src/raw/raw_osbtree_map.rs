@@ -5,8 +5,10 @@ use smallvec::SmallVec;
 
 use super::arena::Arena;
 use super::handle::Handle;
-use super::node::{InternalNode, LeafNode, MAX_CHILDREN, MAX_KEYS, MIN_LEAF_KEYS, Node, SearchResult};
+use super::node::{InternalNode, LeafNode, MAX_KEYS, MIN_LEAF_KEYS, Node, SearchResult};
 use super::size::Size;
+
+mod bulk;
 
 /// How many sibling leaves [`RawOSBTreeMap::seek`] walks before it climbs the finger instead.
 /// Every leaf except a root leaf holds at least `MIN_LEAF_KEYS` keys, so a target within
@@ -261,14 +263,25 @@ impl<K, V> RawOSBTreeMap<K, V> {
 
     /// Allocates `leaf` and links it after `last_leaf`, making it the new last leaf. Returns its
     /// handle. Used when building a tree's leaves left to right.
-    fn push_leaf(&mut self, mut leaf: LeafNode<K>) -> Handle {
-        leaf.set_prev(self.last_leaf);
-        let handle = self.nodes.alloc(Node::Leaf(leaf));
-        match self.last_leaf {
-            Some(prev) => self.nodes.get_mut(prev).as_leaf_mut().set_next(Some(handle)),
-            None => self.first_leaf = Some(handle),
+    fn push_leaf(&mut self, leaf: LeafNode<K>) -> Handle {
+        Self::link_leaf(&mut self.nodes, &mut self.first_leaf, &mut self.last_leaf, leaf)
+    }
+
+    /// Allocates `leaf` in `nodes` and links it after `last`, updating the chain ends `first`
+    /// and `last`. Returns its handle.
+    fn link_leaf(
+        nodes: &mut Arena<Node<K>>,
+        first: &mut Option<Handle>,
+        last: &mut Option<Handle>,
+        mut leaf: LeafNode<K>,
+    ) -> Handle {
+        leaf.set_prev(*last);
+        let handle = nodes.alloc(Node::Leaf(leaf));
+        match *last {
+            Some(prev) => nodes.get_mut(prev).as_leaf_mut().set_next(Some(handle)),
+            None => *first = Some(handle),
         }
-        self.last_leaf = Some(handle);
+        *last = Some(handle);
         handle
     }
 
@@ -309,16 +322,8 @@ impl<K, V> RawOSBTreeMap<K, V> {
         let mut current_leaf = self.first_leaf;
 
         while let Some(leaf_handle) = current_leaf {
-            let leaf = self.nodes.get_mut(leaf_handle).as_leaf_mut();
-            let next = leaf.next();
-            let (keys, value_handles) = leaf.take_all();
-
-            for (key, vh) in keys.into_iter().zip(value_handles) {
-                let value = self.values.take(vh);
-                result.push((key, value));
-            }
-
-            current_leaf = next;
+            current_leaf = self.nodes.get(leaf_handle).as_leaf().next();
+            self.move_entries(leaf_handle, .., &mut result);
         }
 
         // Every value has been taken, so the tree can be reset wholesale.
@@ -576,79 +581,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         I: IntoIterator<Item = (K, V)>,
         I::IntoIter: ExactSizeIterator,
     {
-        /// Splits `total` items into `parts` counts that differ by at most one.
-        fn even_split(total: usize, parts: usize) -> impl Iterator<Item = usize> {
-            (0..parts).map(move |i| total / parts + usize::from(i < total % parts))
-        }
-
-        let mut entries = entries.into_iter();
-        let len = entries.len();
-        if len == 0 {
-            return Self::new();
-        }
-
-        let leaf_count = len.div_ceil(MAX_KEYS);
-        let mut node_count = leaf_count;
-        let mut level_count = leaf_count;
-        while level_count > 1 {
-            level_count = level_count.div_ceil(MAX_CHILDREN);
-            node_count += level_count;
-        }
-
-        let mut tree = Self::with_arena_capacities(node_count, len);
-
-        // Each node on the level being built: (handle, subtree size, rightmost leaf). The
-        // rightmost leaf's last key is the node's max key, which is its separator in the parent.
-        let mut level: alloc::vec::Vec<(Handle, usize, Handle)> = alloc::vec::Vec::with_capacity(leaf_count);
-        for count in even_split(len, leaf_count) {
-            let mut leaf = LeafNode::new();
-            for _ in 0..count {
-                let (key, value) = entries.next().expect("`from_sorted_iter()` - fewer entries than `len()`");
-                debug_assert!(
-                    leaf.last_key()
-                        .or_else(|| tree.last_leaf.and_then(|prev| tree.nodes.get(prev).as_leaf().last_key()))
-                        .is_none_or(|last| *last < key),
-                    "`from_sorted_iter()` - keys must be strictly increasing"
-                );
-                let value_handle = tree.values.alloc(value);
-                leaf.push(key, value_handle);
-            }
-            let handle = tree.push_leaf(leaf);
-            level.push((handle, count, handle));
-        }
-        debug_assert!(entries.next().is_none(), "`from_sorted_iter()` - more entries than `len()`");
-
-        while level.len() > 1 {
-            let parent_count = level.len().div_ceil(MAX_CHILDREN);
-            let mut parents = alloc::vec::Vec::with_capacity(parent_count);
-            let mut rest = level.as_slice();
-            for count in even_split(level.len(), parent_count) {
-                let (group, tail) = rest.split_at(count);
-                rest = tail;
-                let mut node = InternalNode::new();
-                let (first, first_size, _) = group[0];
-                node.set_first_child(first, Size::from_usize(first_size));
-                for pair in group.windows(2) {
-                    let ((_, _, left_rightmost), (child, child_size, _)) = (pair[0], pair[1]);
-                    let separator = tree
-                        .nodes
-                        .get(left_rightmost)
-                        .as_leaf()
-                        .last_key()
-                        .expect("built leaves are non-empty")
-                        .clone();
-                    node.push_child(separator, child, Size::from_usize(child_size));
-                }
-                let size = group.iter().map(|&(_, size, _)| size).sum();
-                node.set_size(Size::from_usize(size));
-                parents.push((tree.nodes.alloc(Node::Internal(node)), size, group[count - 1].2));
-            }
-            level = parents;
-        }
-
-        tree.root = Some(level[0].0);
-        tree.len = len;
-        tree
+        Self::build_tree(entries, bulk::clone_last_key)
     }
 
     /// Descends from `root` to a leaf and returns the leaf's handle. At each internal node,
@@ -788,6 +721,18 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
     /// and the old value if the key was already present. Value handles are stable across
     /// node splits, so the handle stays valid until the entry is removed.
     pub(crate) fn insert_with_handle(&mut self, key: K, value: V) -> (Handle, Option<V>) {
+        self.insert_impl(key, value, false)
+    }
+
+    /// Inserts a key-value pair, but if an equal key is present, replaces only the key and keeps
+    /// the stored value. Returns `value` if it was not stored.
+    pub(crate) fn insert_key_keep_value(&mut self, key: K, value: V) -> Option<V> {
+        self.insert_impl(key, value, true).1
+    }
+
+    /// Inserts `key` and `value`. If an equal key is present, `keep_value` chooses between
+    /// replacing the value (returning the old one) and replacing the key (returning `value`).
+    fn insert_impl(&mut self, key: K, value: V, keep_value: bool) -> (Handle, Option<V>) {
         let Some(root) = self.root else {
             let value_handle = self.values.alloc(value);
             let mut leaf = LeafNode::new();
@@ -807,8 +752,13 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         let leaf = self.nodes.get_mut(current).as_leaf_mut();
         match leaf.search(&key) {
             SearchResult::Found(idx) => {
-                // Key exists, replace value in-place to avoid alloc/free churn
                 let value_handle = leaf.value(idx);
+                if keep_value {
+                    // An equal key compares the same as the old one, so separators stay valid.
+                    leaf.replace_key(idx, key);
+                    return (value_handle, Some(value));
+                }
+                // Key exists, replace value in-place to avoid alloc/free churn
                 let old_value = core::mem::replace(self.values.get_mut(value_handle), value);
                 (value_handle, Some(old_value))
             }
@@ -2113,9 +2063,9 @@ mod tests {
         let mid_key = *tree.node(mid).as_leaf().key(0);
 
         // Create empty neighbors around `mid` to exercise empty-leaf fallbacks.
-        let _ = tree.node_mut(prev).as_leaf_mut().take_all();
-        let _ = tree.node_mut(mid).as_leaf_mut().take_all();
-        let _ = tree.node_mut(next).as_leaf_mut().take_all();
+        tree.node_mut(prev).as_leaf_mut().drain(..).for_each(drop);
+        tree.node_mut(mid).as_leaf_mut().drain(..).for_each(drop);
+        tree.node_mut(next).as_leaf_mut().drain(..).for_each(drop);
 
         // With an empty next leaf, lower/upper bounds should return None here.
         assert_eq!(tree.lower_bound(&mid_key), None);
@@ -2215,8 +2165,8 @@ mod tests {
 
         let first = tree.first_leaf().expect("first leaf exists");
         let last = tree.last_leaf().expect("last leaf exists");
-        let _ = tree.node_mut(first).as_leaf_mut().take_all();
-        let _ = tree.node_mut(last).as_leaf_mut().take_all();
+        tree.node_mut(first).as_leaf_mut().drain(..).for_each(drop);
+        tree.node_mut(last).as_leaf_mut().drain(..).for_each(drop);
 
         assert_eq!(tree.first_key_value(), None);
         assert_eq!(tree.last_key_value(), None);
@@ -2251,7 +2201,7 @@ mod tests {
     #[test]
     fn upper_bound_returns_none_when_next_leaf_is_empty() {
         let (mut tree, _root, _left, right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
-        let _ = tree.node_mut(right).as_leaf_mut().take_all();
+        tree.node_mut(right).as_leaf_mut().drain(..).for_each(drop);
 
         // Found at the last index with an empty next leaf should return None.
         assert_eq!(tree.upper_bound(&4), None);
@@ -2260,7 +2210,7 @@ mod tests {
     #[test]
     fn lower_bound_exclusive_returns_none_when_prev_leaf_is_empty() {
         let (mut tree, _root, left, _right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
-        let _ = tree.node_mut(left).as_leaf_mut().take_all();
+        tree.node_mut(left).as_leaf_mut().drain(..).for_each(drop);
 
         // Found at index 0 with an empty previous leaf should return None.
         assert_eq!(tree.lower_bound_exclusive(&6), None);

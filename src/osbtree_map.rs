@@ -1030,27 +1030,19 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// # Complexity
     ///
-    /// O(m log(n + m)), where m is the size of `other` and n is the size of `self`.
+    /// With m the size of `other` and n the size of `self`:
+    ///
+    /// - O(min(n, m) + log(n + m)) amortized when every key in `other` is greater than every
+    ///   key in `self`, or every one is less: the smaller tree is grafted onto the larger.
+    /// - O(min(n, m) log(n + m)) when the key ranges overlap and one map is much smaller: its
+    ///   entries are inserted into the other.
+    /// - O(n + m) when the key ranges overlap and the sizes are similar: both are merged and
+    ///   the tree is rebuilt.
     pub fn append(&mut self, other: &mut Self)
     where
         K: Clone + Ord,
     {
-        if other.is_empty() {
-            return;
-        }
-
-        // Fast path: if self is empty, just swap the raw trees (O(1))
-        if self.is_empty() {
-            core::mem::swap(&mut self.raw, &mut other.raw);
-            return;
-        }
-
-        // Drain the other tree in O(n) via leaf-chain walk, then insert each entry.
-        // This avoids the O(log n) rebalancing cost per pop_first from the old approach.
-        let entries = other.raw.drain_to_vec();
-        for (k, v) in entries {
-            self.raw.insert(k, v);
-        }
+        self.raw.append(&mut other.raw);
     }
 
     /// Constructs a double-ended iterator over a sub-range of elements in the map.
@@ -1211,25 +1203,16 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// # Complexity
     ///
-    /// O(m log(n)), where m is the number of elements being split off.
+    /// O(min(m, n - m) + log n), where n is the size of the map and m is the number of elements
+    /// split off: whichever side is smaller is moved out.
     #[allow(clippy::return_self_not_must_use)]
     pub fn split_off<Q: Ord>(&mut self, key: &Q) -> Self
     where
         K: Borrow<Q> + Clone + Ord,
     {
-        // Collect keys to move (keys >= split key)
-        let keys_to_move: alloc::vec::Vec<K> =
-            self.range::<Q, _>((Bound::Included(key), Bound::Unbounded)).map(|(k, _)| k.clone()).collect();
-
-        // Build the new map and remove from self
-        let mut other = OSBTreeMap::new();
-        for k in keys_to_move {
-            // Use remove::<K> to remove by the key type K
-            if let Some(v) = self.remove::<K>(&k) {
-                other.insert(k, v);
-            }
+        OSBTreeMap {
+            raw: self.raw.split_off(key),
         }
-        other
     }
 
     /// Creates an iterator that visits elements (key-value pairs) in the specified range in
@@ -2402,8 +2385,8 @@ mod tests {
         let first = map.raw.first_leaf().expect("non-empty map has a first leaf");
         let last = map.raw.last_leaf().expect("non-empty map has a last leaf");
 
-        let _ = map.raw.node_mut(first).as_leaf_mut().take_all();
-        let _ = map.raw.node_mut(last).as_leaf_mut().take_all();
+        map.raw.node_mut(first).as_leaf_mut().drain(..).for_each(drop);
+        map.raw.node_mut(last).as_leaf_mut().drain(..).for_each(drop);
 
         assert!(map.first_entry().is_none());
         assert!(map.last_entry().is_none());

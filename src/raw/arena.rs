@@ -22,6 +22,11 @@ impl<T> Arena<T> {
         }
     }
 
+    /// Reserves room for at least `additional` more elements beyond the free slots.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.slots.reserve(additional.saturating_sub(self.free.len()));
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.slots.capacity()
     }
@@ -35,6 +40,12 @@ impl<T> Arena<T> {
     #[cfg(test)]
     pub(crate) const fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Iterates over the live elements.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().flatten()
     }
 
     #[cfg(test)]

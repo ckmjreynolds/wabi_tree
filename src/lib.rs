@@ -57,8 +57,9 @@
 #![warn(clippy::all)]
 #![warn(clippy::cargo)]
 #![warn(clippy::pedantic)]
-// Enable coverage attributes for nightly builds.
-#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// Enable coverage attributes for nightly coverage builds. Only the `#[cfg(test)]` modules use
+// them, so the feature is enabled only for test builds of the crate.
+#![cfg_attr(all(coverage_nightly, test), feature(coverage_attribute))]
 
 extern crate alloc;
 

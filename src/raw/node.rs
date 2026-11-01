@@ -1,4 +1,5 @@
 use core::borrow::Borrow;
+use core::ops::RangeBounds;
 
 use smallvec::SmallVec;
 
@@ -87,6 +88,30 @@ impl<K> Node<K> {
         }
     }
 
+    /// Returns the leaf node by value, panicking if this is not a leaf.
+    pub(crate) fn into_leaf(self) -> LeafNode<K> {
+        match self {
+            Node::Leaf(leaf) => leaf,
+            Node::Internal(_) => panic!("expected leaf node"),
+        }
+    }
+
+    /// Returns the internal node by value, panicking if this is not internal.
+    pub(crate) fn into_internal(self) -> InternalNode<K> {
+        match self {
+            Node::Internal(internal) => internal,
+            Node::Leaf(_) => panic!("expected internal node"),
+        }
+    }
+
+    /// How full the node is: its keys if a leaf, its children if internal.
+    pub(crate) fn fill(&self) -> usize {
+        match self {
+            Node::Internal(internal) => internal.child_count(),
+            Node::Leaf(leaf) => leaf.key_count(),
+        }
+    }
+
     /// Returns the leaf node mutably, panicking if this is not a leaf.
     pub(crate) fn as_leaf_mut(&mut self) -> &mut LeafNode<K> {
         match self {
@@ -119,6 +144,17 @@ impl<K> Node<K> {
             Node::Leaf(leaf) => leaf.key_count(),
         }
     }
+    /// Returns true if any of the node's buffers outgrew its inline capacity and moved to the
+    /// heap. A node never holds more than one entry over its maximum, so this should not happen.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn spilled(&self) -> bool {
+        match self {
+            Node::Internal(n) => n.keys.spilled() || n.children.spilled() || n.child_sizes.spilled(),
+            Node::Leaf(n) => n.keys.spilled() || n.values.spilled(),
+        }
+    }
+
     /// Returns the number of key/value pairs in the subtree rooted at this node.
     pub(crate) fn subtree_size(&self) -> Size {
         match self {
@@ -342,7 +378,88 @@ impl<K> InternalNode<K> {
         self.child_sizes.append(&mut right.child_sizes);
         self.update_size();
     }
+
+    /// Replaces the separator key at `index`, returning the old one.
+    pub(crate) fn replace_key(&mut self, index: usize, key: K) -> K {
+        core::mem::replace(&mut self.keys[index], key)
+    }
+
+    /// Keeps only the first `count` children (and the separators between them).
+    pub(crate) fn truncate_children(&mut self, count: usize) {
+        self.keys.truncate(count - 1);
+        self.children.truncate(count);
+        self.child_sizes.truncate(count);
+        self.update_size();
+    }
+
+    /// Drops the first `count` children and the separators that follow them.
+    pub(crate) fn drop_front_children(&mut self, count: usize) {
+        self.keys.drain(..count);
+        self.children.drain(..count);
+        self.child_sizes.drain(..count);
+        self.update_size();
+    }
+
+    /// Removes the last `count` children, with the separators between them. Also returns the
+    /// key before them, the new max of what remains: this node's new separator in its parent.
+    pub(crate) fn take_back(&mut self, count: usize) -> (K, MovedChildren<K>) {
+        let child_count = self.children.len();
+        let mut keys: SmallVec<[K; MAX_KEYS + 1]> = self.keys.drain(child_count - count - 1..).collect();
+        let new_max = keys.remove(0);
+        let moved = MovedChildren {
+            keys,
+            children: self.children.drain(child_count - count..).collect(),
+            child_sizes: self.child_sizes.drain(child_count - count..).collect(),
+        };
+        self.update_size();
+        (new_max, moved)
+    }
+
+    /// Removes the first `count` children, with the separators between them. Also returns the
+    /// key after them, their max: the new separator in the parent of whichever node receives
+    /// them.
+    pub(crate) fn take_front(&mut self, count: usize) -> (K, MovedChildren<K>) {
+        let mut keys: SmallVec<[K; MAX_KEYS + 1]> = self.keys.drain(..count).collect();
+        let max = keys.pop().expect("`take_front()` - moved at least one child");
+        let moved = MovedChildren {
+            keys,
+            children: self.children.drain(..count).collect(),
+            child_sizes: self.child_sizes.drain(..count).collect(),
+        };
+        self.update_size();
+        (max, moved)
+    }
+
+    /// Puts `moved` in front of the existing children. `separator` is the max of the last moved
+    /// child, which now separates it from the old first child.
+    pub(crate) fn prepend(&mut self, mut moved: MovedChildren<K>, separator: K) {
+        moved.keys.push(separator);
+        self.keys.insert_many(0, moved.keys);
+        self.children.insert_many(0, moved.children);
+        self.child_sizes.insert_many(0, moved.child_sizes);
+        self.update_size();
+    }
+
+    /// Puts `moved` after the existing children. `separator` is the max of the current last
+    /// child, which now separates it from the first moved child.
+    pub(crate) fn extend(&mut self, separator: K, moved: MovedChildren<K>) {
+        self.keys.push(separator);
+        self.keys.extend(moved.keys);
+        self.children.extend(moved.children);
+        self.child_sizes.extend(moved.child_sizes);
+        self.update_size();
+    }
 }
+
+/// Children moved between internal siblings, with the separators between them.
+pub(crate) struct MovedChildren<K> {
+    keys: SmallVec<[K; MAX_KEYS + 1]>,
+    children: SmallVec<[Handle; MAX_CHILDREN + 1]>,
+    child_sizes: SmallVec<[Size; MAX_CHILDREN + 1]>,
+}
+
+/// Entries moved out of a leaf: keys and their value handles.
+pub(crate) type LeafEntries<K> = (SmallVec<[K; MAX_KEYS + 1]>, SmallVec<[Handle; MAX_KEYS + 1]>);
 
 impl<K> LeafNode<K> {
     /// Creates a new empty leaf node.
@@ -488,32 +605,19 @@ impl<K> LeafNode<K> {
         }
     }
 
-    /// Takes ownership of all keys and value handles, leaving the leaf empty.
-    pub(crate) fn take_all(&mut self) -> (SmallVec<[K; MAX_KEYS + 1]>, SmallVec<[Handle; MAX_KEYS + 1]>) {
-        let keys = core::mem::take(&mut self.keys);
-        let values = core::mem::take(&mut self.values);
-        (keys, values)
-    }
-
     /// Splits this leaf at the midpoint. Returns (`split_key`, `new_node`).
     /// The `split_key` is the last key in the left (current) node.
     pub(crate) fn split(&mut self) -> (K, LeafNode<K>)
     where
         K: Clone,
     {
-        let mid = self.keys.len() / 2;
-
         // The split key is the last key in the left node (for B+tree separator). Clone it before
         // moving anything, so a panicking `K::clone` leaves this leaf intact.
+        let mid = self.keys.len() / 2;
         let split_key = self.keys[mid - 1].clone();
-
-        // Create the right node
         let mut right = LeafNode::new();
-
-        // Move keys[mid..] and values[mid..] to right node
         right.keys = self.keys.drain(mid..).collect();
         right.values = self.values.drain(mid..).collect();
-
         (split_key, right)
     }
 
@@ -522,6 +626,38 @@ impl<K> LeafNode<K> {
         self.keys.append(&mut right.keys);
         self.values.append(&mut right.values);
         self.next = right.next;
+    }
+
+    /// Replaces the key at `index` with one that compares equal, returning the old one.
+    pub(crate) fn replace_key(&mut self, index: usize, key: K) -> K {
+        core::mem::replace(&mut self.keys[index], key)
+    }
+
+    /// Removes the entries in `range`, yielding each key with its value handle.
+    pub(crate) fn drain<R: RangeBounds<usize> + Clone>(&mut self, range: R) -> impl Iterator<Item = (K, Handle)> + '_ {
+        self.keys.drain(range.clone()).zip(self.values.drain(range))
+    }
+
+    /// Removes and returns the entries from `at` onward.
+    pub(crate) fn take_tail(&mut self, at: usize) -> LeafEntries<K> {
+        (self.keys.drain(at..).collect(), self.values.drain(at..).collect())
+    }
+
+    /// Removes and returns the entries before `at`.
+    pub(crate) fn take_head(&mut self, at: usize) -> LeafEntries<K> {
+        (self.keys.drain(..at).collect(), self.values.drain(..at).collect())
+    }
+
+    /// Puts `entries` in front of the existing ones.
+    pub(crate) fn prepend(&mut self, (keys, values): LeafEntries<K>) {
+        self.keys.insert_many(0, keys);
+        self.values.insert_many(0, values);
+    }
+
+    /// Puts `entries` after the existing ones.
+    pub(crate) fn extend(&mut self, (keys, values): LeafEntries<K>) {
+        self.keys.extend(keys);
+        self.values.extend(values);
     }
 }
 
@@ -559,6 +695,20 @@ mod tests {
     fn as_internal_panics_on_leaf() {
         let leaf_node: Node<i32> = Node::new_leaf();
         let _ = leaf_node.as_internal();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected leaf node")]
+    fn into_leaf_panics_on_internal() {
+        let internal_node: Node<i32> = Node::new_internal();
+        let _ = internal_node.into_leaf();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected internal node")]
+    fn into_internal_panics_on_leaf() {
+        let leaf_node: Node<i32> = Node::new_leaf();
+        let _ = leaf_node.into_internal();
     }
 
     #[test]

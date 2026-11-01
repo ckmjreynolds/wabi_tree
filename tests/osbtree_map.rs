@@ -1942,6 +1942,27 @@ mod drop_tests {
     }
 
     #[test]
+    fn panicking_key_clone_during_merging_append_drops_every_value_once() {
+        use super::{PanickyKey, with_panicking_clone};
+        let drops = Rc::new(Cell::new(0));
+        let mut map = OSBTreeMap::new();
+        let mut other = OSBTreeMap::new();
+        // Interleaved keys of similar count: merged and rebuilt, which clones separators.
+        for i in 0..3_000u32 {
+            map.insert(PanickyKey(i * 2), Droppable::new(i.into(), drops.clone()));
+            other.insert(PanickyKey(i * 3), Droppable::new(i.into(), drops.clone()));
+        }
+        assert!(with_panicking_clone(|| map.append(&mut other)));
+        // The rebuild failed: both maps are left empty and usable, and every value was dropped.
+        assert!(map.is_empty() && other.is_empty());
+        assert_eq!(drops.get(), 6_000);
+        map.insert(PanickyKey(1), Droppable::new(1, drops.clone()));
+        assert_eq!(map.len(), 1);
+        drop(map);
+        assert_eq!(drops.get(), 6_001);
+    }
+
+    #[test]
     fn values_dropped_on_remove() {
         let drop_count = Rc::new(Cell::new(0));
         let mut map: OSBTreeMap<i64, Droppable> = OSBTreeMap::new();
@@ -3262,4 +3283,138 @@ fn extend_still_keeps_first_key_and_last_value() {
     map.extend([(tagged(1, 0), "a"), (tagged(1, 1), "b")]);
     let items: Vec<_> = map.iter().map(|(k, &v)| (k.key, k.tag, v)).collect();
     assert_eq!(items, [(1, 0, "b")]);
+}
+
+// ─── append / split_off: std parity and panic safety ───────────────────────
+
+/// The `(key, tag, value)` triples of a map with `Tagged` keys.
+type TaggedTriples = Vec<(u8, usize, usize)>;
+
+/// Appends `b` to `a` and returns the `(key, tag, value)` triples of the result, along with
+/// what they should be: on equal keys, the key (and so the tag) from `a` and the value from `b`.
+///
+/// This is checked against a model rather than `BTreeMap`, whose behaviour changed: up to at
+/// least Rust 1.88 it took the whole entry from `other`; current releases keep `self`'s key.
+fn append_tagged(a: &[u8], b: &[u8]) -> (TaggedTriples, TaggedTriples) {
+    // Tags in `b` start at 1000, so the side each surviving key came from is visible.
+    let b_entries: Vec<_> = b.iter().enumerate().map(|(i, &k)| (tagged(k, 1_000 + i), 1_000 + i)).collect();
+    let mut os: OSBTreeMap<Tagged, usize> = tagged_entries(a).into_iter().collect();
+    let mut os_other: OSBTreeMap<Tagged, usize> = b_entries.iter().map(|&(k, v)| (tagged(k.key, k.tag), v)).collect();
+    os.append(&mut os_other);
+    assert!(os_other.is_empty());
+
+    let mut model: BTreeMap<u8, (usize, usize)> =
+        tagged_entries(a).into_iter().map(|(k, v)| (k.key, (k.tag, v))).collect();
+    for (k, v) in b_entries {
+        model.entry(k.key).and_modify(|entry| entry.1 = v).or_insert((k.tag, v));
+    }
+    (os.iter().map(|(k, &v)| (k.key, k.tag, v)).collect(), model.into_iter().map(|(k, (tag, v))| (k, tag, v)).collect())
+}
+
+#[test]
+fn append_equal_keys_keep_key_from_self_and_value_from_other() {
+    let evens: Vec<u8> = (0..=254).step_by(2).collect();
+    let all: Vec<u8> = (0..=255).collect();
+    let few = vec![3u8, 4, 200];
+    // Few into many, many into few (inserted the other way round), and similar sizes (merged).
+    for (a, b) in [(&all, &few), (&few, &all), (&evens, &all), (&all, &evens), (&all, &all)] {
+        let (os, bt) = append_tagged(a, b);
+        assert_eq!(os, bt);
+    }
+}
+
+proptest! {
+    #[test]
+    fn append_disjoint_ranges_matches_btreemap(
+        a_len in 0usize..3_000,
+        b_len in 0usize..3_000,
+        b_first in any::<bool>(),
+    ) {
+        let (low, high) = (0..a_len as i64, 10_000..10_000 + b_len as i64);
+        let (a, b) = if b_first { (high, low) } else { (low, high) };
+        let mut os_a: OSBTreeMap<i64, i64> = a.clone().map(|k| (k, k)).collect();
+        let mut os_b: OSBTreeMap<i64, i64> = b.clone().map(|k| (k, -k)).collect();
+        let mut bt_a: BTreeMap<i64, i64> = a.map(|k| (k, k)).collect();
+        let mut bt_b: BTreeMap<i64, i64> = b.map(|k| (k, -k)).collect();
+        os_a.append(&mut os_b);
+        bt_a.append(&mut bt_b);
+        prop_assert!(os_b.is_empty());
+        prop_assert!(os_a.iter().eq(bt_a.iter()));
+        prop_assert!(os_a.iter().rev().eq(bt_a.iter().rev()));
+        for (rank, (k, _)) in bt_a.iter().enumerate().step_by(97) {
+            prop_assert_eq!(os_a.rank_of(k), Some(rank));
+        }
+    }
+}
+
+#[test]
+fn panicking_key_clone_during_split_off_leaves_map_unchanged() {
+    let mut model = BTreeMap::new();
+    let mut map = OSBTreeMap::new();
+    for i in 0..5_000u32 {
+        let k = (i * 7_919) % 5_000;
+        map.insert(PanickyKey(k * 2), k);
+        model.insert(k * 2, k);
+    }
+    let mut panics = 0;
+    for at in [0, 1, 150, 2_500, 5_001, 9_000, 9_850, 9_998, 10_000] {
+        let mut right = None;
+        if with_panicking_clone(|| right = Some(map.split_off(&PanickyKey(at)))) {
+            panics += 1;
+            assert_matches_model(&map, &model);
+        } else {
+            // Nothing needed cloning: a split at either end, or too few elements moved.
+            let mut model_left = model.clone();
+            let model_right = model_left.split_off(&at);
+            let mut right = right.expect("split_off returned");
+            assert_matches_model(&map, &model_left);
+            assert_matches_model(&right, &model_right);
+            map.append(&mut right);
+        }
+    }
+    assert!(panics > 0, "the test should exercise at least one panicking clone");
+
+    // Both halves work normally afterwards.
+    let mut right = map.split_off(&PanickyKey(4_000));
+    let model_right = model.split_off(&4_000);
+    assert_matches_model(&map, &model);
+    assert_matches_model(&right, &model_right);
+    right.insert(PanickyKey(1), 1);
+    map.append(&mut right);
+    model.extend(model_right);
+    model.insert(1, 1);
+    assert_matches_model(&map, &model);
+}
+
+#[test]
+fn panicking_key_clone_during_disjoint_append_leaves_both_maps_unchanged() {
+    for (n, m, other_first) in [(5_000, 3_000, false), (3_000, 5_000, false), (5_000, 200, true), (100, 50, false)] {
+        let offset = |first: bool| {
+            if first {
+                0
+            } else {
+                100_000
+            }
+        };
+        let mut map: OSBTreeMap<PanickyKey, u32> = OSBTreeMap::new();
+        let mut other: OSBTreeMap<PanickyKey, u32> = OSBTreeMap::new();
+        let mut model = BTreeMap::new();
+        let mut model_other = BTreeMap::new();
+        for i in 0..n {
+            map.insert(PanickyKey(i + offset(other_first)), i);
+            model.insert(i + offset(other_first), i);
+        }
+        for i in 0..m {
+            other.insert(PanickyKey(i + offset(!other_first)), i);
+            model_other.insert(i + offset(!other_first), i);
+        }
+        assert!(with_panicking_clone(|| map.append(&mut other)));
+        assert_matches_model(&map, &model);
+        assert_matches_model(&other, &model_other);
+
+        map.append(&mut other);
+        model.append(&mut model_other);
+        assert!(other.is_empty());
+        assert_matches_model(&map, &model);
+    }
 }
