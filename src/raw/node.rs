@@ -1,4 +1,5 @@
 use core::borrow::Borrow;
+use core::ops::RangeBounds;
 
 use smallvec::SmallVec;
 
@@ -364,47 +365,50 @@ impl<K> InternalNode<K> {
         self.update_size();
     }
 
-    /// Removes the last `count` children. Returns them with the `count` keys before and
-    /// between them: the first returned key is the new max of what remains, so it becomes
-    /// this node's separator in its parent.
-    pub(crate) fn take_back(&mut self, count: usize) -> MovedChildren<K> {
+    /// Removes the last `count` children, with the separators between them. Also returns the
+    /// key before them, the new max of what remains: this node's new separator in its parent.
+    pub(crate) fn take_back(&mut self, count: usize) -> (K, MovedChildren<K>) {
         let child_count = self.children.len();
+        let mut keys: SmallVec<[K; MAX_KEYS + 1]> = self.keys.drain(child_count - count - 1..).collect();
+        let new_max = keys.remove(0);
         let moved = MovedChildren {
-            keys: self.keys.drain(child_count - count - 1..).collect(),
+            keys,
             children: self.children.drain(child_count - count..).collect(),
             child_sizes: self.child_sizes.drain(child_count - count..).collect(),
         };
         self.update_size();
-        moved
+        (new_max, moved)
     }
 
-    /// Removes the first `count` children. Returns them with the `count` keys after each
-    /// of them: the last returned key is the max of the moved children, so it becomes the
-    /// separator in the parent of whichever node receives them.
-    pub(crate) fn take_front(&mut self, count: usize) -> MovedChildren<K> {
+    /// Removes the first `count` children, with the separators between them. Also returns the
+    /// key after them, their max: the new separator in the parent of whichever node receives
+    /// them.
+    pub(crate) fn take_front(&mut self, count: usize) -> (K, MovedChildren<K>) {
+        let mut keys: SmallVec<[K; MAX_KEYS + 1]> = self.keys.drain(..count).collect();
+        let max = keys.pop().expect("`take_front()` - moved at least one child");
         let moved = MovedChildren {
-            keys: self.keys.drain(..count).collect(),
+            keys,
             children: self.children.drain(..count).collect(),
             child_sizes: self.child_sizes.drain(..count).collect(),
         };
         self.update_size();
-        moved
+        (max, moved)
     }
 
-    /// Puts `moved` in front of the existing children. `moved.keys` must hold one key per
-    /// moved child: the separators between them and then the max of the last one.
-    pub(crate) fn prepend(&mut self, moved: MovedChildren<K>) {
-        debug_assert_eq!(moved.keys.len(), moved.children.len());
+    /// Puts `moved` in front of the existing children. `separator` is the max of the last moved
+    /// child, which now separates it from the old first child.
+    pub(crate) fn prepend(&mut self, mut moved: MovedChildren<K>, separator: K) {
+        moved.keys.push(separator);
         self.keys.insert_many(0, moved.keys);
         self.children.insert_many(0, moved.children);
         self.child_sizes.insert_many(0, moved.child_sizes);
         self.update_size();
     }
 
-    /// Puts `moved` after the existing children. `moved.keys` must hold one key per moved
-    /// child: the max of the current last child and then the separators between them.
-    pub(crate) fn extend(&mut self, moved: MovedChildren<K>) {
-        debug_assert_eq!(moved.keys.len(), moved.children.len());
+    /// Puts `moved` after the existing children. `separator` is the max of the current last
+    /// child, which now separates it from the first moved child.
+    pub(crate) fn extend(&mut self, separator: K, moved: MovedChildren<K>) {
+        self.keys.push(separator);
         self.keys.extend(moved.keys);
         self.children.extend(moved.children);
         self.child_sizes.extend(moved.child_sizes);
@@ -417,9 +421,9 @@ impl<K> InternalNode<K> {
     }
 }
 
-/// Children moved between internal siblings, with the keys that go with them.
+/// Children moved between internal siblings, with the separators between them.
 pub(crate) struct MovedChildren<K> {
-    pub(crate) keys: SmallVec<[K; MAX_KEYS + 1]>,
+    keys: SmallVec<[K; MAX_KEYS + 1]>,
     children: SmallVec<[Handle; MAX_CHILDREN + 1]>,
     child_sizes: SmallVec<[Size; MAX_CHILDREN + 1]>,
 }
@@ -572,6 +576,7 @@ impl<K> LeafNode<K> {
     }
 
     /// Takes ownership of all keys and value handles, leaving the leaf empty.
+    #[cfg(test)]
     pub(crate) fn take_all(&mut self) -> (SmallVec<[K; MAX_KEYS + 1]>, SmallVec<[Handle; MAX_KEYS + 1]>) {
         let keys = core::mem::take(&mut self.keys);
         let values = core::mem::take(&mut self.values);
@@ -584,20 +589,16 @@ impl<K> LeafNode<K> {
     where
         K: Clone,
     {
-        let mid = self.keys.len() / 2;
-
         // The split key is the last key in the left node (for B+tree separator). Clone it before
         // moving anything, so a panicking `K::clone` leaves this leaf intact.
-        let split_key = self.keys[mid - 1].clone();
+        let split_key = self.keys[Self::split_index(self.keys.len()) - 1].clone();
+        (split_key, self.split_half())
+    }
 
-        // Create the right node
-        let mut right = LeafNode::new();
-
-        // Move keys[mid..] and values[mid..] to right node
-        right.keys = self.keys.drain(mid..).collect();
-        right.values = self.values.drain(mid..).collect();
-
-        (split_key, right)
+    /// Where [`Self::split`] and [`Self::split_half`] divide a leaf of `len` entries: the
+    /// right half starts at this index.
+    pub(crate) const fn split_index(len: usize) -> usize {
+        len / 2
     }
 
     /// Merges with a right sibling.
@@ -605,6 +606,11 @@ impl<K> LeafNode<K> {
         self.keys.append(&mut right.keys);
         self.values.append(&mut right.values);
         self.next = right.next;
+    }
+
+    /// Removes the entries in `range`, yielding each key with its value handle.
+    pub(crate) fn drain<R: RangeBounds<usize> + Clone>(&mut self, range: R) -> impl Iterator<Item = (K, Handle)> + '_ {
+        self.keys.drain(range.clone()).zip(self.values.drain(range))
     }
 
     /// Removes and returns the entries from `at` onward.
@@ -632,7 +638,7 @@ impl<K> LeafNode<K> {
     /// Splits this leaf at the midpoint, as [`Self::split`] does, but without cloning the
     /// separator: the caller supplies it (a clone of the left half's last key).
     pub(crate) fn split_half(&mut self) -> LeafNode<K> {
-        let mid = self.keys.len() / 2;
+        let mid = Self::split_index(self.keys.len());
         let mut right = LeafNode::new();
         right.keys = self.keys.drain(mid..).collect();
         right.values = self.values.drain(mid..).collect();

@@ -263,14 +263,25 @@ impl<K, V> RawOSBTreeMap<K, V> {
 
     /// Allocates `leaf` and links it after `last_leaf`, making it the new last leaf. Returns its
     /// handle. Used when building a tree's leaves left to right.
-    fn push_leaf(&mut self, mut leaf: LeafNode<K>) -> Handle {
-        leaf.set_prev(self.last_leaf);
-        let handle = self.nodes.alloc(Node::Leaf(leaf));
-        match self.last_leaf {
-            Some(prev) => self.nodes.get_mut(prev).as_leaf_mut().set_next(Some(handle)),
-            None => self.first_leaf = Some(handle),
+    fn push_leaf(&mut self, leaf: LeafNode<K>) -> Handle {
+        Self::link_leaf(&mut self.nodes, &mut self.first_leaf, &mut self.last_leaf, leaf)
+    }
+
+    /// Allocates `leaf` in `nodes` and links it after `last`, updating the chain ends `first`
+    /// and `last`. Returns its handle.
+    fn link_leaf(
+        nodes: &mut Arena<Node<K>>,
+        first: &mut Option<Handle>,
+        last: &mut Option<Handle>,
+        mut leaf: LeafNode<K>,
+    ) -> Handle {
+        leaf.set_prev(*last);
+        let handle = nodes.alloc(Node::Leaf(leaf));
+        match *last {
+            Some(prev) => nodes.get_mut(prev).as_leaf_mut().set_next(Some(handle)),
+            None => *first = Some(handle),
         }
-        self.last_leaf = Some(handle);
+        *last = Some(handle);
         handle
     }
 
@@ -311,16 +322,8 @@ impl<K, V> RawOSBTreeMap<K, V> {
         let mut current_leaf = self.first_leaf;
 
         while let Some(leaf_handle) = current_leaf {
-            let leaf = self.nodes.get_mut(leaf_handle).as_leaf_mut();
-            let next = leaf.next();
-            let (keys, value_handles) = leaf.take_all();
-
-            for (key, vh) in keys.into_iter().zip(value_handles) {
-                let value = self.values.take(vh);
-                result.push((key, value));
-            }
-
-            current_leaf = next;
+            current_leaf = self.nodes.get(leaf_handle).as_leaf().next();
+            self.move_entries(leaf_handle, .., &mut result);
         }
 
         // Every value has been taken, so the tree can be reset wholesale.
@@ -578,7 +581,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         I: IntoIterator<Item = (K, V)>,
         I::IntoIter: ExactSizeIterator,
     {
-        Self::build_from_sorted(entries)
+        Self::build_tree(entries, bulk::clone_last_key)
     }
 
     /// Descends from `root` to a leaf and returns the leaf's handle. At each internal node,

@@ -1942,6 +1942,27 @@ mod drop_tests {
     }
 
     #[test]
+    fn panicking_key_clone_during_merging_append_drops_every_value_once() {
+        use super::{PanickyKey, with_panicking_clone};
+        let drops = Rc::new(Cell::new(0));
+        let mut map = OSBTreeMap::new();
+        let mut other = OSBTreeMap::new();
+        // Interleaved keys of similar count: merged and rebuilt, which clones separators.
+        for i in 0..3_000u32 {
+            map.insert(PanickyKey(i * 2), Droppable::new(i.into(), drops.clone()));
+            other.insert(PanickyKey(i * 3), Droppable::new(i.into(), drops.clone()));
+        }
+        assert!(with_panicking_clone(|| map.append(&mut other)));
+        // The rebuild failed: both maps are left empty and usable, and every value was dropped.
+        assert!(map.is_empty() && other.is_empty());
+        assert_eq!(drops.get(), 6_000);
+        map.insert(PanickyKey(1), Droppable::new(1, drops.clone()));
+        assert_eq!(map.len(), 1);
+        drop(map);
+        assert_eq!(drops.get(), 6_001);
+    }
+
+    #[test]
     fn values_dropped_on_remove() {
         let drop_count = Rc::new(Cell::new(0));
         let mut map: OSBTreeMap<i64, Droppable> = OSBTreeMap::new();
@@ -3389,33 +3410,4 @@ fn panicking_key_clone_during_disjoint_append_leaves_both_maps_unchanged() {
         assert!(other.is_empty());
         assert_matches_model(&map, &model);
     }
-}
-
-/// A value that counts how many times values have been dropped.
-struct DropCounted(std::rc::Rc<std::cell::Cell<usize>>);
-
-impl Drop for DropCounted {
-    fn drop(&mut self) {
-        self.0.set(self.0.get() + 1);
-    }
-}
-
-#[test]
-fn panicking_key_clone_during_merging_append_drops_every_value_once() {
-    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-    let mut map = OSBTreeMap::new();
-    let mut other = OSBTreeMap::new();
-    // Interleaved keys of similar count: merged and rebuilt, which clones separators.
-    for i in 0..3_000u32 {
-        map.insert(PanickyKey(i * 2), DropCounted(drops.clone()));
-        other.insert(PanickyKey(i * 3), DropCounted(drops.clone()));
-    }
-    assert!(with_panicking_clone(|| map.append(&mut other)));
-    // The rebuild failed: both maps are left empty and usable, and every value was dropped.
-    assert!(map.is_empty() && other.is_empty());
-    assert_eq!(drops.get(), 6_000);
-    map.insert(PanickyKey(1), DropCounted(drops.clone()));
-    assert_eq!(map.len(), 1);
-    drop(map);
-    assert_eq!(drops.get(), 6_001);
 }

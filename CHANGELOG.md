@@ -24,12 +24,12 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 - `split_off` on the map and set no longer clones every key it moves and removes and inserts
   them one at a time. It now moves whichever side of the split is smaller out of the tree in
   bulk, rebuilds it in O(n), and repairs the cut edge of the other side, for
-  O(min(m, n − m) + log n): 4–640× faster on 10,000 elements, depending on the split point (#21).
+  O(min(m, n − m) + log n): 6–900× faster on 10,000 elements, depending on the split point (#21).
 - `append` on the map and set now grafts the smaller tree onto the larger when their key ranges
   don't overlap, in O(min(n, m) + log(n + m)), and merges and rebuilds in O(n + m) when they
   overlap and are of similar size. Inserting one element at a time is kept for overlapping
-  ranges when `other` is much smaller. On 10,000 elements, appending disjoint halves is 3.8×
-  faster and interleaved halves 3.4× faster, about twice as fast as `BTreeMap` (#21).
+  ranges when `other` is much smaller. On 10,000 elements, appending disjoint halves is 4.9×
+  faster and interleaved halves 3.9× faster, more than twice as fast as `BTreeMap` (#21).
   If `K::clone` panics, `split_off` and a disjoint `append` leave both trees as they were. A
   merging `append` drops every entry and leaves both maps empty; it used to keep what it had
   inserted before the panic.
