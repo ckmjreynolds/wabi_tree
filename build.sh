@@ -1,5 +1,9 @@
 #!/bin/bash
 clear
+
+# Cap parallel Miri tests (each one pins a core); override with NEXTEST_TEST_THREADS=N ./build.sh.
+export NEXTEST_TEST_THREADS=${NEXTEST_TEST_THREADS:-4}
+
 cargo +stable fmt || exit
 cargo +stable clippy --all-targets -- -Dwarnings || exit
 cargo +stable test --release || exit
