@@ -1514,9 +1514,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
         self.inner.size_hint()
     }
 
-    fn last(mut self) -> Option<&'a T> {
-        self.next_back()
-    }
+    o1_terminals!(sorted);
 }
 
 impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
@@ -1580,6 +1578,8 @@ impl<T: Clone + Ord> Iterator for IntoIter<T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<T: Clone + Ord> DoubleEndedIterator for IntoIter<T> {
@@ -1635,6 +1635,8 @@ impl<'a, T> Iterator for Range<'a, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<'a, T> DoubleEndedIterator for Range<'a, T> {
@@ -1644,6 +1646,25 @@ impl<'a, T> DoubleEndedIterator for Range<'a, T> {
 
     fn nth_back(&mut self, n: usize) -> Option<&'a T> {
         self.inner.nth_back(n).map(|(k, ())| k)
+    }
+}
+
+impl<T> ExactSizeIterator for Range<'_, T> {
+    /// Returns the number of elements remaining in the range.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wabi_tree::OSBTreeSet;
+    ///
+    /// let set = OSBTreeSet::from([1, 2, 3, 4, 5]);
+    /// let mut range = set.range(2..5);
+    /// assert_eq!(range.len(), 3);
+    /// range.next_back();
+    /// assert_eq!(range.len(), 2);
+    /// ```
+    fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 

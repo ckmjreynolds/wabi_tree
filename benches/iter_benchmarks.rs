@@ -1,4 +1,5 @@
-//! Iterator positioning benchmarks: `skip`, `rev().skip`, `step_by`, and a plain full walk.
+//! Iterator positioning benchmarks: `skip`, `rev().skip`, `step_by`, `last`/`count`, and a
+//! plain full walk.
 //!
 //! `skip(n)` and `step_by(s)` are implemented in std on top of `Iterator::nth`, so these measure
 //! how cheaply an iterator can jump forward or backward by rank (issue #18).
@@ -23,6 +24,14 @@
 //!
 //! `iter_full` is within code-layout noise: `BTreeMap`'s own `iter_full`, which #18 does not
 //! touch, moved by up to 35% between the two builds.
+//!
+//! `iter_terminals` measures `keys().last()` and `range(..).count()`, which #19 made O(1)
+//! instead of walking every remaining element (N = 1,000,000, 800,000 in the range):
+//!
+//! | benchmark                                  |  before |   after |
+//! |--------------------------------------------|--------:|--------:|
+//! | `iter_terminals/OSBTreeMap/keys_last`      | 2.15 ms | 3.46 ns |
+//! | `iter_terminals/OSBTreeMap/range_count`    | 1.39 ms | 72.4 ns |
 
 // `skip(n).next()` is deliberate: it is the call pattern from issue #18 being measured.
 #![allow(clippy::iter_skip_next)]
@@ -112,6 +121,24 @@ fn bench_iter_full(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_iter_terminals(c: &mut Criterion) {
+    let (os_map, bt_map) = maps();
+    let mut group = c.benchmark_group("iter_terminals");
+    group.bench_function(BenchmarkId::new("OSBTreeMap", "keys_last"), |b| {
+        b.iter(|| black_box(&os_map).keys().last());
+    });
+    group.bench_function(BenchmarkId::new("BTreeMap", "keys_last"), |b| {
+        b.iter(|| black_box(&bt_map).keys().last());
+    });
+    group.bench_function(BenchmarkId::new("OSBTreeMap", "range_count"), |b| {
+        b.iter(|| black_box(&os_map).range(RANGE).count());
+    });
+    group.bench_function(BenchmarkId::new("BTreeMap", "range_count"), |b| {
+        b.iter(|| black_box(&bt_map).range(RANGE).count());
+    });
+    group.finish();
+}
+
 criterion_group!(
     iter_benches,
     bench_iter_skip,
@@ -119,6 +146,7 @@ criterion_group!(
     bench_range_skip,
     bench_iter_step_by,
     bench_iter_full,
+    bench_iter_terminals,
 );
 
 criterion_main!(iter_benches);

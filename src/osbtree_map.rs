@@ -1716,6 +1716,8 @@ impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.span.len(), Some(self.span.len()))
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<'a, K: 'a, V: 'a> DoubleEndedIterator for Iter<'a, K, V> {
@@ -1811,6 +1813,8 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.span.len(), Some(self.span.len()))
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for IterMut<'_, K, V> {
@@ -1867,6 +1871,8 @@ impl<K, V> Iterator for IntoIter<K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
@@ -1922,6 +1928,8 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for Keys<'_, K, V> {
@@ -1986,9 +1994,7 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
         self.inner.size_hint()
     }
 
-    fn last(mut self) -> Option<Self::Item> {
-        self.next_back()
-    }
+    o1_terminals!();
 }
 
 impl<K, V> DoubleEndedIterator for Values<'_, K, V> {
@@ -2053,9 +2059,7 @@ impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
         self.inner.size_hint()
     }
 
-    fn last(mut self) -> Option<Self::Item> {
-        self.next_back()
-    }
+    o1_terminals!();
 }
 
 impl<K, V> DoubleEndedIterator for ValuesMut<'_, K, V> {
@@ -2111,6 +2115,8 @@ impl<K: Clone + Ord, V> Iterator for IntoKeys<K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K: Clone + Ord, V> DoubleEndedIterator for IntoKeys<K, V> {
@@ -2166,6 +2172,8 @@ impl<K: Clone + Ord, V> Iterator for IntoValues<K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!();
 }
 
 impl<K: Clone + Ord, V> DoubleEndedIterator for IntoValues<K, V> {
@@ -2221,6 +2229,8 @@ impl<'a, K, V> Iterator for Range<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for Range<'_, K, V> {
@@ -2284,6 +2294,8 @@ impl<'a, K, V> Iterator for RangeMut<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for RangeMut<'_, K, V> {

@@ -190,3 +190,18 @@ fn nth_on_mutable_iterators_keeps_references_valid() {
     assert!(written.iter().all(|k| (10..990).contains(k)));
     assert!(map.iter().all(|(k, v)| *v == k + u32::from(written.contains(k))));
 }
+
+#[test]
+fn terminals_on_mutable_iterators_return_valid_references() {
+    let mut map = map();
+    let (k, v) = map.iter_mut().last().unwrap();
+    *v += 1;
+    let k = *k;
+    let (_, v) = map.range_mut(10..990).max().unwrap();
+    *v += 1;
+    let v = map.values_mut().min().unwrap();
+    *v += 1;
+    assert_eq!(map[&k], k + 1);
+    assert_eq!(map[&989], 990);
+    assert_eq!(map.range_mut(..).count(), map.len());
+}

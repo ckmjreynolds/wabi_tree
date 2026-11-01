@@ -2886,6 +2886,16 @@ fn jump_map_strategy() -> impl Strategy<Value = OSBTreeMap<i64, i64>> {
     )
 }
 
+/// Advances `it` by one `step`, returning the element it yields.
+fn apply_step<I: DoubleEndedIterator>(it: &mut I, step: Step) -> Option<I::Item> {
+    match step {
+        Step::Next => it.next(),
+        Step::NextBack => it.next_back(),
+        Step::Nth(n) => it.nth(n),
+        Step::NthBack(n) => it.nth_back(n),
+    }
+}
+
 /// Applies `steps` to `actual` and to a slice iterator over `expected`, asserting the same keys
 /// and lengths after every step, then drains both from the front.
 fn assert_steps_match<I: DoubleEndedIterator + ExactSizeIterator>(
@@ -2896,12 +2906,7 @@ fn assert_steps_match<I: DoubleEndedIterator + ExactSizeIterator>(
 ) -> Result<(), TestCaseError> {
     let mut expected = expected.iter().copied();
     for &step in steps {
-        let (a, e) = match step {
-            Step::Next => (actual.next(), expected.next()),
-            Step::NextBack => (actual.next_back(), expected.next_back()),
-            Step::Nth(n) => (actual.nth(n), expected.nth(n)),
-            Step::NthBack(n) => (actual.nth_back(n), expected.nth_back(n)),
-        };
+        let (a, e) = (apply_step(&mut actual, step), apply_step(&mut expected, step));
         prop_assert_eq!(a.map(&key), e, "after {:?}", step);
         prop_assert_eq!(actual.len(), expected.len(), "len after {:?}", step);
     }
@@ -2964,4 +2969,127 @@ fn nth_on_empty_and_exhausted_iterators() {
     let mut iter = map.iter();
     assert_eq!(iter.nth_back(999), Some((&0, &0)));
     assert_eq!(iter.next(), None);
+}
+
+// ─── O(1) terminals: last / count / min / max ───────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+enum Terminal {
+    Last,
+    Count,
+    Min,
+    Max,
+}
+
+fn terminal_strategy() -> impl Strategy<Value = Terminal> {
+    prop_oneof![Just(Terminal::Last), Just(Terminal::Count), Just(Terminal::Min), Just(Terminal::Max)]
+}
+
+/// Applies `steps` to `actual` and to a slice iterator over `expected`, then compares
+/// `terminal` on both. `key` must preserve order so that `min`/`max` agree on the mapped values.
+fn assert_terminal_matches<I>(
+    mut actual: I,
+    key: impl Fn(I::Item) -> i64,
+    expected: &[i64],
+    steps: &[Step],
+    terminal: Terminal,
+) -> Result<(), TestCaseError>
+where
+    I: DoubleEndedIterator + ExactSizeIterator,
+    I::Item: Ord,
+{
+    let mut expected = expected.iter().copied();
+    for &step in steps {
+        apply_step(&mut actual, step);
+        apply_step(&mut expected, step);
+    }
+    match terminal {
+        Terminal::Last => prop_assert_eq!(actual.last().map(&key), expected.last()),
+        Terminal::Count => prop_assert_eq!(actual.count(), expected.count()),
+        Terminal::Min => prop_assert_eq!(actual.min().map(&key), expected.min()),
+        Terminal::Max => prop_assert_eq!(actual.max().map(&key), expected.max()),
+    }
+    Ok(())
+}
+
+/// Overwrites every value with one that is not monotonic in its key, so a value iterator that
+/// wrongly took the sorted `min`/`max` shortcut would fail. Returns the keys and values in order.
+fn scramble_values(map: &mut OSBTreeMap<i64, i64>) -> (Vec<i64>, Vec<i64>) {
+    for (k, v) in map.iter_mut() {
+        *v = (k * 7_919) % 1_009 - 500;
+    }
+    (map.keys().copied().collect(), map.values().copied().collect())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// `last`/`count`/`min`/`max` on the shared and owning iterators match a slice iterator
+    /// after partial consumption from both ends.
+    #[test]
+    fn iter_terminals_match_slice(
+        mut map in jump_map_strategy(),
+        steps in proptest::collection::vec(step_strategy(), 0..20),
+        terminal in terminal_strategy(),
+    ) {
+        let (keys, values) = scramble_values(&mut map);
+        assert_terminal_matches(map.iter(), |(k, _)| *k, &keys, &steps, terminal)?;
+        assert_terminal_matches(map.keys(), |k| *k, &keys, &steps, terminal)?;
+        assert_terminal_matches(map.values(), |v| *v, &values, &steps, terminal)?;
+        assert_terminal_matches(map.clone().into_iter(), |(k, _)| k, &keys, &steps, terminal)?;
+        assert_terminal_matches(map.clone().into_keys(), |k| k, &keys, &steps, terminal)?;
+        assert_terminal_matches(map.into_values(), |v| v, &values, &steps, terminal)?;
+    }
+
+    /// `last`/`count`/`min`/`max` on `iter_mut` and `values_mut` match a slice iterator.
+    #[test]
+    fn iter_mut_terminals_match_slice(
+        mut map in jump_map_strategy(),
+        steps in proptest::collection::vec(step_strategy(), 0..20),
+        terminal in terminal_strategy(),
+    ) {
+        let (keys, values) = scramble_values(&mut map);
+        assert_terminal_matches(map.iter_mut(), |(k, _)| *k, &keys, &steps, terminal)?;
+        assert_terminal_matches(map.values_mut(), |v| *v, &values, &steps, terminal)?;
+    }
+
+    /// `last`/`count`/`min`/`max` on `range` and `range_mut` match a slice iterator.
+    #[test]
+    fn range_terminals_match_slice(
+        mut map in jump_map_strategy(),
+        lo in -100i64..60_000,
+        len in 0i64..60_000,
+        steps in proptest::collection::vec(step_strategy(), 0..20),
+        terminal in terminal_strategy(),
+    ) {
+        let hi = lo + len;
+        let keys: Vec<i64> = map.keys().copied().filter(|k| (lo..hi).contains(k)).collect();
+        assert_terminal_matches(map.range(lo..hi), |(k, _)| *k, &keys, &steps, terminal)?;
+        assert_terminal_matches(map.range_mut(lo..hi), |(k, _)| *k, &keys, &steps, terminal)?;
+    }
+}
+
+#[test]
+fn terminals_on_empty_and_exhausted_iterators() {
+    let mut map: OSBTreeMap<i64, i64> = OSBTreeMap::new();
+    assert_eq!(map.iter().last(), None);
+    assert_eq!(map.keys().count(), 0);
+    assert_eq!(map.range(..).min(), None);
+    assert_eq!(map.range_mut(..).max(), None);
+    assert_eq!(map.clone().into_keys().max(), None);
+
+    map.extend((0..1_000).map(|k| (k, -k)));
+    assert_eq!(map.iter().min(), Some((&0, &0)));
+    assert_eq!(map.iter().max(), Some((&999, &-999)));
+    assert_eq!(map.iter_mut().last(), Some((&999, &mut -999)));
+    assert_eq!(map.keys().max(), Some(&999));
+    assert_eq!(map.values().max(), Some(&0)); // values aren't sorted; the default scan applies
+    assert_eq!(map.range(10..20).count(), 10);
+    assert_eq!(map.range(10..20).last(), Some((&19, &-19)));
+    let mut range = map.range(10..20);
+    assert_eq!(range.nth(9), Some((&19, &-19)));
+    assert_eq!((range.clone().last(), range.clone().count(), range.min()), (None, 0, None));
+    let mut iter = map.clone().into_iter();
+    iter.next_back();
+    assert_eq!(iter.max(), Some((998, -998)));
 }

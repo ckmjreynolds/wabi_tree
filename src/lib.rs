@@ -62,6 +62,42 @@
 
 extern crate alloc;
 
+/// Overrides the `Iterator` terminals that a double-ended, exact-size iterator answers in O(1)
+/// instead of walking every remaining element: `last` and `count`, plus `min` and `max` with the
+/// `sorted` arm, which is only valid for iterators that yield items in ascending order.
+///
+/// Invoke it inside an `impl Iterator` block.
+macro_rules! o1_terminals {
+    () => {
+        fn last(mut self) -> Option<Self::Item> {
+            self.next_back()
+        }
+
+        fn count(self) -> usize {
+            self.len()
+        }
+    };
+    (sorted) => {
+        o1_terminals!();
+
+        fn min(mut self) -> Option<Self::Item>
+        where
+            Self::Item: Ord,
+        {
+            // Items are yielded in ascending order, so the first is the minimum.
+            self.next()
+        }
+
+        fn max(mut self) -> Option<Self::Item>
+        where
+            Self::Item: Ord,
+        {
+            // Items are yielded in ascending order, so the last is the maximum.
+            self.next_back()
+        }
+    };
+}
+
 mod order_statistic;
 mod raw;
 

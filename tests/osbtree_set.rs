@@ -1560,3 +1560,59 @@ fn set_iterators_step_by_match_vec() {
         assert_eq!(set.range(1_000..40_000).rev().step_by(step).copied().collect::<Vec<_>>(), expected_range_back);
     }
 }
+
+// ─── O(1) terminals: last / count / min / max ───────────────────────────────
+
+/// Builds a fresh iterator with `make`, consumes `front` elements from the front and `back`
+/// from the back, then checks `len`/`last`/`count`/`min`/`max` against the remaining slice.
+fn check_terminals<I, F>(make: F, key: impl Fn(I::Item) -> i64, expected: &[i64])
+where
+    F: Fn() -> I,
+    I: DoubleEndedIterator<Item: Ord> + ExactSizeIterator,
+{
+    for (front, back) in [(0, 0), (1, 0), (0, 1), (63, 64), (1_000, 0), (0, 5_000), (6_000, 6_000)] {
+        let lo = front.min(expected.len());
+        let rest = &expected[lo..expected.len().saturating_sub(back).max(lo)];
+        let fresh = || {
+            let mut it = make();
+            if front > 0 {
+                it.nth(front - 1);
+            }
+            if back > 0 {
+                it.nth_back(back - 1);
+            }
+            it
+        };
+        let ctx = format!("front {front}, back {back}");
+        assert_eq!(fresh().len(), rest.len(), "len: {ctx}");
+        assert_eq!(fresh().count(), rest.len(), "count: {ctx}");
+        assert_eq!(fresh().last().map(&key), rest.last().copied(), "last: {ctx}");
+        assert_eq!(fresh().min().map(&key), rest.first().copied(), "min: {ctx}");
+        assert_eq!(fresh().max().map(&key), rest.last().copied(), "max: {ctx}");
+    }
+}
+
+/// `last`/`count`/`min`/`max` on the set iterators match a `Vec` after partial consumption.
+#[test]
+fn set_iterator_terminals_match_vec() {
+    let set: OSBTreeSet<i64> = (0..20_000).filter(|k| k % 7 != 3).collect();
+    let all: Vec<i64> = set.iter().copied().collect();
+    let in_range: Vec<i64> = all.iter().copied().filter(|k| (500..15_000).contains(k)).collect();
+    check_terminals(|| set.iter(), |k| *k, &all);
+    check_terminals(|| set.clone().into_iter(), |k| k, &all);
+    check_terminals(|| set.range(500..15_000), |k| *k, &in_range);
+    check_terminals(|| set.range(-5..0), |k| *k, &[]);
+}
+
+#[test]
+fn set_range_len_tracks_both_ends() {
+    let set: OSBTreeSet<u32> = (0..1_000).collect();
+    let mut range = set.range(100..200);
+    assert_eq!(range.len(), 100);
+    range.next();
+    range.next_back();
+    assert_eq!(range.len(), 98);
+    assert_eq!(range.nth(97), Some(&198));
+    assert_eq!(range.len(), 0);
+    assert_eq!(set.range(5..5).len(), 0);
+}
