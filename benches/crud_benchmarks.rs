@@ -639,8 +639,6 @@ fn bench_set_is_subset(c: &mut Criterion) {
     group.finish();
 }
 
-// ─── Criterion Groups ───────────────────────────────────────────────────────
-
 // ─── Bulk construction (FromIterator) ────────────────────────────────────────
 
 fn key_orders() -> [(&'static str, Vec<i64>); 3] {
@@ -672,6 +670,8 @@ fn bench_set_collect(c: &mut Criterion) {
         group.finish();
     }
 }
+
+// ─── Criterion Groups ───────────────────────────────────────────────────────
 
 criterion_group!(map_insert_benches, bench_map_insert_ordered, bench_map_insert_reverse, bench_map_insert_random,);
 

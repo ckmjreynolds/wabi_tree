@@ -3157,6 +3157,46 @@ fn tagged_entries(keys: &[u8]) -> Vec<(Tagged, usize)> {
     keys.iter().enumerate().map(|(tag, &key)| (tagged(key, tag), tag * 10)).collect()
 }
 
+/// A key whose `==` compares both fields but whose `Ord` compares only `key`, so the two can
+/// disagree. The tree orders by `Ord`, so `collect` must treat `Ord`-equal keys as duplicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StrictEqKey {
+    key: u8,
+    extra: u8,
+}
+
+impl PartialOrd for StrictEqKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for StrictEqKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+#[test]
+fn from_iter_dedups_by_ord_not_partial_eq() {
+    let first = StrictEqKey {
+        key: 1,
+        extra: 0,
+    };
+    let second = StrictEqKey {
+        key: 1,
+        extra: 1,
+    };
+    let map: OSBTreeMap<_, _> = [(first, "a"), (second, "b")].into_iter().collect();
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.iter().map(|(k, &v)| (k.extra, v)).collect::<Vec<_>>(), [(1, "b")]);
+    assert_eq!(map.rank_of(&first), Some(0));
+
+    let set: wabi_tree::OSBTreeSet<_> = [first, second].into_iter().collect();
+    assert_eq!(set.len(), 1);
+    assert_eq!(set.first().map(|k| k.extra), Some(1));
+}
+
 fn assert_collect_matches_btreemap(entries: &[(Tagged, usize)]) {
     let os_map: OSBTreeMap<Tagged, usize> = entries.iter().copied().collect();
     let bt_map: BTreeMap<Tagged, usize> = entries.iter().copied().collect();
