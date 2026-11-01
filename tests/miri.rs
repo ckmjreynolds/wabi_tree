@@ -232,3 +232,18 @@ fn terminals_on_mutable_iterators_return_valid_references() {
     assert_eq!(map[&989], 990);
     assert_eq!(map.range_mut(..).count(), map.len());
 }
+
+/// `collect` sorts, drops discarded duplicates and clones separators. Heap-allocated keys and
+/// values let Miri catch a leak or double drop on any of those paths.
+#[test]
+fn collect_with_duplicates_and_heap_keys() {
+    let entries = (0..N).rev().map(|i| (format!("{:04}", i % 600), i.to_string()));
+    let map: OSBTreeMap<String, String> = entries.clone().collect();
+    let model: BTreeMap<String, String> = entries.collect();
+    assert!(map.iter().eq(model.iter()));
+    assert_eq!(alternate(map.iter()).len(), model.len());
+
+    let set: OSBTreeSet<String> = model.into_keys().rev().collect();
+    assert_eq!(set.len(), 600);
+    assert_eq!(set.get_by_rank(599).map(String::as_str), Some("0599"));
+}

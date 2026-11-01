@@ -639,6 +639,38 @@ fn bench_set_is_subset(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── Bulk construction (FromIterator) ────────────────────────────────────────
+
+fn key_orders() -> [(&'static str, Vec<i64>); 3] {
+    [("ordered", ordered_keys(N)), ("reverse", reverse_ordered_keys(N)), ("random", random_keys(N))]
+}
+
+fn bench_map_collect(c: &mut Criterion) {
+    for (order, keys) in key_orders() {
+        let mut group = c.benchmark_group(format!("map_collect_{order}"));
+        group.bench_function(BenchmarkId::new("OSBTreeMap", N), |b| {
+            b.iter(|| keys.iter().map(|&k| (k, k)).collect::<OSBTreeMap<i64, i64>>());
+        });
+        group.bench_function(BenchmarkId::new("BTreeMap", N), |b| {
+            b.iter(|| keys.iter().map(|&k| (k, k)).collect::<BTreeMap<i64, i64>>());
+        });
+        group.finish();
+    }
+}
+
+fn bench_set_collect(c: &mut Criterion) {
+    for (order, keys) in key_orders() {
+        let mut group = c.benchmark_group(format!("set_collect_{order}"));
+        group.bench_function(BenchmarkId::new("OSBTreeSet", N), |b| {
+            b.iter(|| keys.iter().copied().collect::<OSBTreeSet<i64>>());
+        });
+        group.bench_function(BenchmarkId::new("BTreeSet", N), |b| {
+            b.iter(|| keys.iter().copied().collect::<BTreeSet<i64>>());
+        });
+        group.finish();
+    }
+}
+
 // ─── Criterion Groups ───────────────────────────────────────────────────────
 
 criterion_group!(map_insert_benches, bench_map_insert_ordered, bench_map_insert_reverse, bench_map_insert_random,);
@@ -660,6 +692,8 @@ criterion_group!(set_remove_benches, bench_set_remove_ordered, bench_set_remove_
 
 criterion_group!(set_relation_benches, bench_set_is_subset);
 
+criterion_group!(collect_benches, bench_map_collect, bench_set_collect);
+
 criterion_main!(
     map_insert_benches,
     map_get_benches,
@@ -668,4 +702,5 @@ criterion_main!(
     set_contains_benches,
     set_remove_benches,
     set_relation_benches,
+    collect_benches,
 );
