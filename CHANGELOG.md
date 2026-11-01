@@ -6,6 +6,13 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+### Performance
+- `OSBTreeSet::is_subset` and `is_superset` now return early when the smaller set's bounds fall
+  outside the larger set's, or when an O(log n) range count shows the larger set has too few
+  elements in that span. Otherwise they choose by size between walking both sets side by side
+  (visiting only the larger set's elements within the smaller set's span) and looking up each
+  element (#22).
+
 ## [0.1.4] - 2026-11-01
 
 ### Added

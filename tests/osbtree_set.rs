@@ -310,6 +310,17 @@ proptest! {
 
 // ─── Set operations ──────────────────────────────────────────────────────────
 
+/// Checks is_subset / is_superset in both directions against BTreeSet.
+fn check_subset_relations(bt_a: &BTreeSet<i64>, bt_b: &BTreeSet<i64>) -> Result<(), TestCaseError> {
+    let os_a: OSBTreeSet<i64> = bt_a.iter().cloned().collect();
+    let os_b: OSBTreeSet<i64> = bt_b.iter().cloned().collect();
+    prop_assert_eq!(os_a.is_subset(&os_b), bt_a.is_subset(bt_b), "is_subset mismatch");
+    prop_assert_eq!(os_b.is_subset(&os_a), bt_b.is_subset(bt_a), "reverse is_subset mismatch");
+    prop_assert_eq!(os_a.is_superset(&os_b), bt_a.is_superset(bt_b), "is_superset mismatch");
+    prop_assert_eq!(os_b.is_superset(&os_a), bt_b.is_superset(bt_a), "reverse is_superset mismatch");
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
 
@@ -496,13 +507,57 @@ proptest! {
         values_a in proptest::collection::vec(value_strategy(), TEST_SIZE / 2),
         values_b in proptest::collection::vec(value_strategy(), TEST_SIZE / 2),
     ) {
-        let os_a: OSBTreeSet<i64> = values_a.iter().cloned().collect();
-        let os_b: OSBTreeSet<i64> = values_b.iter().cloned().collect();
         let bt_a: BTreeSet<i64> = values_a.iter().cloned().collect();
         let bt_b: BTreeSet<i64> = values_b.iter().cloned().collect();
+        check_subset_relations(&bt_a, &bt_b)?;
+    }
 
-        prop_assert_eq!(os_a.is_subset(&os_b), bt_a.is_subset(&bt_b), "is_subset mismatch");
-        prop_assert_eq!(os_a.is_superset(&os_b), bt_a.is_superset(&bt_b), "is_superset mismatch");
+    /// Tests is_subset / is_superset when `a` is sampled from `b`, so the cheap early exits
+    /// don't apply. Small samples take the search path; large ones take the stitch path.
+    /// Optionally adds a value that isn't in `b` (a near-miss inside or outside `b`'s span),
+    /// and optionally drops `b`'s min and max from `a` so the spans differ.
+    #[test]
+    fn subset_superset_sampled_matches_btreeset(
+        values_b in proptest::collection::vec(value_strategy(), 1..TEST_SIZE / 2),
+        keep_one_in in prop_oneof![Just(1usize), Just(2usize), Just(40usize), Just(1000usize)],
+        offset in 0usize..1000,
+        extra in proptest::option::of(value_strategy()),
+        trim_ends in any::<bool>(),
+    ) {
+        let bt_b: BTreeSet<i64> = values_b.iter().cloned().collect();
+        let mut bt_a: BTreeSet<i64> = bt_b
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| (i + offset) % keep_one_in == 0)
+            .map(|(_, v)| *v)
+            .collect();
+        if trim_ends {
+            bt_a.remove(bt_b.first().unwrap());
+            bt_a.remove(bt_b.last().unwrap());
+        }
+        if let Some(x) = extra {
+            bt_a.insert(x);
+        }
+        check_subset_relations(&bt_a, &bt_b)?;
+    }
+
+    /// Tests is_subset / is_superset for sets sharing min and max but differing in between,
+    /// and for sets whose spans are disjoint.
+    #[test]
+    fn subset_superset_spans_match_btreeset(
+        values_a in proptest::collection::vec(-200i64..200, 0..300),
+        values_b in proptest::collection::vec(-200i64..200, 0..300),
+        shift in prop_oneof![Just(0i64), Just(1000i64)],
+    ) {
+        let mut bt_a: BTreeSet<i64> = values_a.iter().map(|v| v + shift).collect();
+        let mut bt_b: BTreeSet<i64> = values_b.iter().cloned().collect();
+        if shift == 0 {
+            for set in [&mut bt_a, &mut bt_b] {
+                set.insert(-200);
+                set.insert(200);
+            }
+        }
+        check_subset_relations(&bt_a, &bt_b)?;
     }
 
     /// Tests extract_if matches expected behavior.
@@ -1615,4 +1670,93 @@ fn set_range_len_tracks_both_ends() {
     assert_eq!(range.nth(97), Some(&198));
     assert_eq!(range.len(), 0);
     assert_eq!(set.range(5..5).len(), 0);
+}
+
+#[test]
+fn is_subset_edge_cases() {
+    let empty: OSBTreeSet<i32> = OSBTreeSet::new();
+    let one: OSBTreeSet<i32> = [5].into();
+    let other_one: OSBTreeSet<i32> = [6].into();
+    let evens: OSBTreeSet<i32> = (0..100).map(|v| v * 2).collect();
+
+    // Empty sets.
+    assert!(empty.is_subset(&empty));
+    assert!(empty.is_subset(&one));
+    assert!(!one.is_subset(&empty));
+    assert!(one.is_superset(&empty));
+
+    // Single elements and equal sets.
+    assert!(one.is_subset(&one));
+    assert!(!one.is_subset(&other_one));
+    assert!(evens.is_subset(&evens));
+    assert!(evens.is_superset(&evens));
+
+    // Same span and same count in range, but different elements.
+    let a: OSBTreeSet<i32> = [0, 3, 10].into();
+    let b: OSBTreeSet<i32> = [0, 4, 10].into();
+    assert!(!a.is_subset(&b));
+
+    // Same span, enough elements in range overall, but one missing in the middle.
+    let a: OSBTreeSet<i32> = [0, 2, 3, 198].into();
+    assert!(!a.is_subset(&evens));
+    let a: OSBTreeSet<i32> = [0, 2, 4, 198].into();
+    assert!(a.is_subset(&evens));
+
+    // Similar sizes (stitch path): one element swapped for a near neighbour.
+    let mut a = evens.clone();
+    a.remove(&100);
+    a.insert(101);
+    assert!(!a.is_subset(&evens));
+    a.remove(&101);
+    assert!(a.is_subset(&evens));
+    assert!(evens.is_superset(&a));
+
+    // A value below `other`'s minimum or above its maximum.
+    let a: OSBTreeSet<i32> = [-2, 2].into();
+    assert!(!a.is_subset(&evens));
+    let a: OSBTreeSet<i32> = [2, 200].into();
+    assert!(!a.is_subset(&evens));
+}
+
+/// An `Ord` that reverses once `FLIP` is set, to make `first() > last()` after construction.
+mod flippable {
+    use std::cell::Cell;
+    use std::cmp::Ordering;
+
+    thread_local! {
+        pub static FLIP: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Flippable(pub i32);
+
+    impl PartialOrd for Flippable {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for Flippable {
+        fn cmp(&self, other: &Self) -> Ordering {
+            let ord = self.0.cmp(&other.0);
+            if FLIP.with(Cell::get) {
+                ord.reverse()
+            } else {
+                ord
+            }
+        }
+    }
+}
+
+/// An inconsistent `Ord` may give unspecified results, but `is_subset` must not panic.
+#[test]
+fn is_subset_inconsistent_ord_does_not_panic() {
+    use flippable::{FLIP, Flippable};
+
+    let a: OSBTreeSet<Flippable> = (0..10).map(Flippable).collect();
+    let b = a.clone();
+    FLIP.with(|f| f.set(true));
+    let _ = a.is_subset(&b);
+    let _ = a.is_superset(&b);
+    FLIP.with(|f| f.set(false));
 }

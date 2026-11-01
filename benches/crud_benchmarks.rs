@@ -599,6 +599,46 @@ fn bench_set_remove_random(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── Set Relation Benchmarks ────────────────────────────────────────────────
+
+fn bench_set_is_subset(c: &mut Criterion) {
+    let mut group = c.benchmark_group("set_is_subset");
+
+    let all: Vec<i64> = ordered_keys(N);
+    let evens: Vec<i64> = all.iter().copied().filter(|k| k % 2 == 0).collect();
+    let sparse: Vec<i64> = all.iter().copied().step_by(100).collect();
+    // Larger than `all` overall and covering its span, but missing one element near the end
+    // of it: the range count rejects it in O(log n), while std looks up nearly every element.
+    let missing_one: Vec<i64> =
+        all.iter().copied().filter(|&k| k != N as i64 - 2).chain(N as i64..2 * N as i64).collect();
+    let mut near_miss = evens.clone();
+    *near_miss.last_mut().unwrap() += 1;
+    // (case name, subset candidate, superset candidate)
+    let cases: [(&str, &[i64], &[i64]); 4] = [
+        ("stitch_true", &evens, &all),
+        ("search_true", &sparse, &all),
+        ("range_count_false", &all, &missing_one),
+        ("stitch_late_miss", &near_miss, &all),
+    ];
+
+    for (name, sub, sup) in cases {
+        let os_sub: OSBTreeSet<i64> = sub.iter().copied().collect();
+        let os_sup: OSBTreeSet<i64> = sup.iter().copied().collect();
+        let bt_sub: BTreeSet<i64> = sub.iter().copied().collect();
+        let bt_sup: BTreeSet<i64> = sup.iter().copied().collect();
+        assert_eq!(os_sub.is_subset(&os_sup), bt_sub.is_subset(&bt_sup));
+
+        group.bench_function(BenchmarkId::new("OSBTreeSet", name), |b| {
+            b.iter(|| std::hint::black_box(&os_sub).is_subset(std::hint::black_box(&os_sup)));
+        });
+        group.bench_function(BenchmarkId::new("BTreeSet", name), |b| {
+            b.iter(|| std::hint::black_box(&bt_sub).is_subset(std::hint::black_box(&bt_sup)));
+        });
+    }
+
+    group.finish();
+}
+
 // ─── Criterion Groups ───────────────────────────────────────────────────────
 
 criterion_group!(map_insert_benches, bench_map_insert_ordered, bench_map_insert_reverse, bench_map_insert_random,);
@@ -618,6 +658,8 @@ criterion_group!(
 
 criterion_group!(set_remove_benches, bench_set_remove_ordered, bench_set_remove_reverse, bench_set_remove_random,);
 
+criterion_group!(set_relation_benches, bench_set_is_subset);
+
 criterion_main!(
     map_insert_benches,
     map_get_benches,
@@ -625,4 +667,5 @@ criterion_main!(
     set_insert_benches,
     set_contains_benches,
     set_remove_benches,
+    set_relation_benches,
 );

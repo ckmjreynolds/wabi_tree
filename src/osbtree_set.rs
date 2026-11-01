@@ -520,7 +520,7 @@ impl<T> OSBTreeSet<T> {
         let self_len = self.len();
         let other_len = other.len();
 
-        if other_len > ITER_PERFORMANCE_TIPPING_SIZE_DIFF * self_len {
+        if other_len > self_len.saturating_mul(ITER_PERFORMANCE_TIPPING_SIZE_DIFF) {
             // other is much larger, iterate self and search in other
             Difference {
                 inner: DifferenceInner::Search {
@@ -627,7 +627,7 @@ impl<T> OSBTreeSet<T> {
         let self_len = self.len();
         let other_len = other.len();
 
-        if self_len > ITER_PERFORMANCE_TIPPING_SIZE_DIFF * other_len {
+        if self_len > other_len.saturating_mul(ITER_PERFORMANCE_TIPPING_SIZE_DIFF) {
             // self is much larger, iterate other and search in self
             Intersection {
                 inner: IntersectionInner::Search {
@@ -635,7 +635,7 @@ impl<T> OSBTreeSet<T> {
                     large_set: self,
                 },
             }
-        } else if other_len > ITER_PERFORMANCE_TIPPING_SIZE_DIFF * self_len {
+        } else if other_len > self_len.saturating_mul(ITER_PERFORMANCE_TIPPING_SIZE_DIFF) {
             // other is much larger, iterate self and search in other
             Intersection {
                 inner: IntersectionInner::Search {
@@ -811,14 +811,61 @@ impl<T> OSBTreeSet<T> {
     ///
     /// # Complexity
     ///
-    /// O(m log n) where m is the size of `self` and n is the size of `other`.
+    /// O(1) if `self` is larger than `other` or its key range isn't contained in `other`'s.
+    /// O(log n) if `other` has fewer than m elements within `self`'s key range. Otherwise
+    /// O(m log n) when those elements outnumber `self` by more than 16 times, or O(m + k)
+    /// when they don't, where m is the size of `self`, n is the size of `other`, and k is
+    /// the number of elements of `other` within `self`'s key range.
     #[must_use]
     pub fn is_subset(&self, other: &OSBTreeSet<T>) -> bool
     where
         T: Ord + Clone,
     {
-        // self is a subset of other if all elements of self are in other
-        self.len() <= other.len() && self.iter().all(|v| other.contains(v))
+        let self_len = self.len();
+        if self_len > other.len() {
+            return false;
+        }
+        // `other` is non-empty here unless `self` is empty too.
+        let (Some(self_min), Some(self_max), Some(other_min), Some(other_max)) =
+            (self.first(), self.last(), other.first(), other.last())
+        else {
+            return true;
+        };
+        if self_min < other_min || self_max > other_max {
+            return false;
+        }
+
+        // `range` panics if start > end, which only an inconsistent `Ord` can cause. Fall back
+        // to plain lookups then rather than panicking.
+        if self_min > self_max {
+            return self.iter().all(|v| other.contains(v));
+        }
+
+        // Elements of `other` within `self`'s key range. Counting them is O(log n) via order
+        // statistics.
+        let mut window = other.range::<T, _>(self_min..=self_max);
+        if window.len() > self_len.saturating_mul(ITER_PERFORMANCE_TIPPING_SIZE_DIFF) {
+            // `other` is much denser in this range: search for each element of `self`.
+            return self.iter().all(|v| other.contains(v));
+        }
+
+        // Similar sizes: walk both side by side.
+        let mut self_iter = self.iter();
+        while let Some(a) = self_iter.next() {
+            loop {
+                // `a` and everything after it in `self` must still fit in `window`. On the first
+                // step this rejects a window with fewer than `self_len` elements in O(log n).
+                if window.len() <= self_iter.len() {
+                    return false;
+                }
+                match window.next().map(|b| b.cmp(a)) {
+                    Some(Less) => {}
+                    Some(Equal) => break,
+                    _ => return false,
+                }
+            }
+        }
+        true
     }
 
     /// Returns `true` if the set is a superset of another,
@@ -841,7 +888,9 @@ impl<T> OSBTreeSet<T> {
     ///
     /// # Complexity
     ///
-    /// O(m log n) where m is the size of `other` and n is the size of `self`.
+    /// The same as [`is_subset`](Self::is_subset) with the two sets swapped: O(1), O(log n),
+    /// O(m log n) or O(m + k), where m is the size of `other`, n is the size of `self`, and k
+    /// is the number of elements of `self` within `other`'s key range.
     #[must_use]
     pub fn is_superset(&self, other: &OSBTreeSet<T>) -> bool
     where
