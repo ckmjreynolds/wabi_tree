@@ -84,13 +84,6 @@ pub(crate) struct Span {
     fingers: Option<alloc::boxed::Box<Fingers>>,
 }
 
-impl Default for Span {
-    /// An empty span. It never dereferences its tree pointer.
-    fn default() -> Self {
-        Self::new(RangeCursor::default())
-    }
-}
-
 /// The fingers are only a cache that [`RawOSBTreeMap::seek`] rebuilds on demand, so a clone
 /// starts without them rather than allocating copies.
 impl Clone for Span {
@@ -445,9 +438,8 @@ impl<K, V> RawOSBTreeMap<K, V> {
                 if target - end >= (HOP_LEAVES - hops) * MIN_LEAF_KEYS {
                     break;
                 }
-                let Some(next) = node.next() else {
-                    break;
-                };
+                // `end <= target < len`, so this is not the last leaf.
+                let next = node.next().expect("seek: target is past the last leaf");
                 (leaf, start) = (next, end);
             }
         } else {
@@ -460,9 +452,8 @@ impl<K, V> RawOSBTreeMap<K, V> {
                 if start - target > (HOP_LEAVES - hops) * MIN_LEAF_KEYS {
                     break;
                 }
-                let Some(prev) = leaf_at(leaf).prev() else {
-                    break;
-                };
+                // `target < start`, so this is not the first leaf.
+                let prev = leaf_at(leaf).prev().expect("seek: target is before the first leaf");
                 (leaf, start) = (prev, start - leaf_at(prev).key_count());
             }
         }
