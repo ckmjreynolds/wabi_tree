@@ -63,25 +63,49 @@ fn range_mut_references_can_all_be_held_and_written() {
     assert!(map.iter().all(|(k, v)| (*v == N) == (100..900).contains(k)));
 }
 
+// The double-ended tests below are one per iterator, rather than one test, so that nextest can
+// run them in parallel; under Tree Borrows each takes tens of seconds.
+
 #[test]
-fn double_ended_iteration_meets_in_the_middle() {
+fn double_ended_iter_meets_in_the_middle() {
+    assert_eq!(alternate(map().iter()).len(), N as usize);
+}
+
+#[test]
+fn double_ended_range_meets_in_the_middle() {
+    assert_eq!(alternate(map().range(10..=990)).len(), 981);
+}
+
+#[test]
+fn double_ended_keys_meets_in_the_middle() {
+    assert_eq!(alternate(map().keys()).len(), N as usize);
+}
+
+#[test]
+fn double_ended_values_meets_in_the_middle() {
+    assert_eq!(alternate(map().values()).len(), N as usize);
+}
+
+#[test]
+fn double_ended_iter_mut_meets_in_the_middle() {
     let mut map = map();
     let expected: BTreeMap<u32, u32> = (0..N).map(|i| (i, i)).collect();
-
-    assert_eq!(alternate(map.iter()).len(), N as usize);
-    assert_eq!(alternate(map.range(10..=990)).len(), 981);
-    assert_eq!(alternate(map.keys()).len(), N as usize);
-    assert_eq!(alternate(map.values()).len(), N as usize);
-
     let mut seen: Vec<(u32, u32)> = alternate(map.iter_mut()).into_iter().map(|(k, v)| (*k, *v)).collect();
     seen.sort_unstable();
-    assert!(seen.into_iter().eq(expected.clone()));
+    assert!(seen.into_iter().eq(expected));
+}
 
+#[test]
+fn double_ended_range_mut_meets_in_the_middle() {
+    let mut map = map();
     let mut seen: Vec<u32> = alternate(map.range_mut(..500)).into_iter().map(|(k, _)| *k).collect();
     seen.sort_unstable();
     assert!(seen.into_iter().eq(0..500));
+}
 
-    assert_eq!(alternate(map.values_mut()).len(), N as usize);
+#[test]
+fn double_ended_values_mut_meets_in_the_middle() {
+    assert_eq!(alternate(map().values_mut()).len(), N as usize);
 }
 
 #[test]
@@ -180,12 +204,15 @@ fn jump_hold_and_write<'a, I: DoubleEndedIterator<Item = (&'a u32, &'a mut u32)>
 }
 
 #[test]
-fn nth_on_mutable_iterators_keeps_references_valid() {
+fn nth_on_iter_mut_keeps_references_valid() {
     let mut map = map();
     let written = jump_hold_and_write(map.iter_mut());
     assert!(map.iter().all(|(k, v)| *v == k + u32::from(written.contains(k))));
+}
 
-    let mut map = self::map();
+#[test]
+fn nth_on_range_mut_keeps_references_valid() {
+    let mut map = map();
     let written = jump_hold_and_write(map.range_mut(10..990));
     assert!(written.iter().all(|k| (10..990).contains(k)));
     assert!(map.iter().all(|(k, v)| *v == k + u32::from(written.contains(k))));
