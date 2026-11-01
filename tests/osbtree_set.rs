@@ -1829,3 +1829,18 @@ fn from_array_keeps_last_duplicate() {
     let items: Vec<_> = set.iter().map(|t| (t.key, t.tag)).collect();
     assert_eq!(items, [(1, 1), (2, 2)]);
 }
+
+#[test]
+fn append_equal_values_keep_the_one_in_self() {
+    for other_len in [3usize, 200] {
+        let mut os: OSBTreeSet<Tagged> = (0..=255).map(|k| tagged(k, 0)).collect();
+        let mut bt: BTreeSet<Tagged> = (0..=255).map(|k| tagged(k, 0)).collect();
+        let mut os_other: OSBTreeSet<Tagged> = (0..other_len as u8).map(|k| tagged(k, 1)).collect();
+        let mut bt_other: BTreeSet<Tagged> = (0..other_len as u8).map(|k| tagged(k, 1)).collect();
+        os.append(&mut os_other);
+        bt.append(&mut bt_other);
+        let os_items: Vec<_> = os.iter().map(|t| (t.key, t.tag)).collect();
+        let bt_items: Vec<_> = bt.iter().map(|t| (t.key, t.tag)).collect();
+        assert_eq!(os_items, bt_items);
+    }
+}

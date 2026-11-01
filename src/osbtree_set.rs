@@ -1188,7 +1188,13 @@ impl<T> OSBTreeSet<T> {
     ///
     /// # Complexity
     ///
-    /// O(m log(n + m)), where m is the size of `other` and n is the size of `self`.
+    /// With m the size of `other` and n the size of `self`:
+    ///
+    /// - O(min(n, m) + log(n + m)) when every value in `other` is greater than every value in
+    ///   `self`, or every one is less: the smaller tree is grafted onto the larger.
+    /// - O(m log(n + m)) when the ranges overlap and `other` is much smaller.
+    /// - O(n + m) when the ranges overlap and the sizes are similar: both are merged and the
+    ///   tree is rebuilt.
     pub fn append(&mut self, other: &mut Self)
     where
         T: Clone + Ord,
@@ -1227,7 +1233,8 @@ impl<T> OSBTreeSet<T> {
     ///
     /// # Complexity
     ///
-    /// O(m log(n)), where m is the number of elements being split off.
+    /// O(min(m, n - m) + log n), where n is the size of the set and m is the number of elements
+    /// split off: whichever side is smaller is moved out.
     #[allow(clippy::return_self_not_must_use)]
     pub fn split_off<Q: Ord>(&mut self, value: &Q) -> Self
     where

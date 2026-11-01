@@ -5,8 +5,10 @@ use smallvec::SmallVec;
 
 use super::arena::Arena;
 use super::handle::Handle;
-use super::node::{InternalNode, LeafNode, MAX_CHILDREN, MAX_KEYS, MIN_LEAF_KEYS, Node, SearchResult};
+use super::node::{InternalNode, LeafNode, MAX_KEYS, MIN_LEAF_KEYS, Node, SearchResult};
 use super::size::Size;
+
+mod bulk;
 
 /// How many sibling leaves [`RawOSBTreeMap::seek`] walks before it climbs the finger instead.
 /// Every leaf except a root leaf holds at least `MIN_LEAF_KEYS` keys, so a target within
@@ -576,79 +578,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         I: IntoIterator<Item = (K, V)>,
         I::IntoIter: ExactSizeIterator,
     {
-        /// Splits `total` items into `parts` counts that differ by at most one.
-        fn even_split(total: usize, parts: usize) -> impl Iterator<Item = usize> {
-            (0..parts).map(move |i| total / parts + usize::from(i < total % parts))
-        }
-
-        let mut entries = entries.into_iter();
-        let len = entries.len();
-        if len == 0 {
-            return Self::new();
-        }
-
-        let leaf_count = len.div_ceil(MAX_KEYS);
-        let mut node_count = leaf_count;
-        let mut level_count = leaf_count;
-        while level_count > 1 {
-            level_count = level_count.div_ceil(MAX_CHILDREN);
-            node_count += level_count;
-        }
-
-        let mut tree = Self::with_arena_capacities(node_count, len);
-
-        // Each node on the level being built: (handle, subtree size, rightmost leaf). The
-        // rightmost leaf's last key is the node's max key, which is its separator in the parent.
-        let mut level: alloc::vec::Vec<(Handle, usize, Handle)> = alloc::vec::Vec::with_capacity(leaf_count);
-        for count in even_split(len, leaf_count) {
-            let mut leaf = LeafNode::new();
-            for _ in 0..count {
-                let (key, value) = entries.next().expect("`from_sorted_iter()` - fewer entries than `len()`");
-                debug_assert!(
-                    leaf.last_key()
-                        .or_else(|| tree.last_leaf.and_then(|prev| tree.nodes.get(prev).as_leaf().last_key()))
-                        .is_none_or(|last| *last < key),
-                    "`from_sorted_iter()` - keys must be strictly increasing"
-                );
-                let value_handle = tree.values.alloc(value);
-                leaf.push(key, value_handle);
-            }
-            let handle = tree.push_leaf(leaf);
-            level.push((handle, count, handle));
-        }
-        debug_assert!(entries.next().is_none(), "`from_sorted_iter()` - more entries than `len()`");
-
-        while level.len() > 1 {
-            let parent_count = level.len().div_ceil(MAX_CHILDREN);
-            let mut parents = alloc::vec::Vec::with_capacity(parent_count);
-            let mut rest = level.as_slice();
-            for count in even_split(level.len(), parent_count) {
-                let (group, tail) = rest.split_at(count);
-                rest = tail;
-                let mut node = InternalNode::new();
-                let (first, first_size, _) = group[0];
-                node.set_first_child(first, Size::from_usize(first_size));
-                for pair in group.windows(2) {
-                    let ((_, _, left_rightmost), (child, child_size, _)) = (pair[0], pair[1]);
-                    let separator = tree
-                        .nodes
-                        .get(left_rightmost)
-                        .as_leaf()
-                        .last_key()
-                        .expect("built leaves are non-empty")
-                        .clone();
-                    node.push_child(separator, child, Size::from_usize(child_size));
-                }
-                let size = group.iter().map(|&(_, size, _)| size).sum();
-                node.set_size(Size::from_usize(size));
-                parents.push((tree.nodes.alloc(Node::Internal(node)), size, group[count - 1].2));
-            }
-            level = parents;
-        }
-
-        tree.root = Some(level[0].0);
-        tree.len = len;
-        tree
+        Self::build_from_sorted(entries)
     }
 
     /// Descends from `root` to a leaf and returns the leaf's handle. At each internal node,
