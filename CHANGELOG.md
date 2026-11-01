@@ -6,7 +6,16 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+### Changed
+- When `collect`, `from_iter` or `From<[_; N]>` meets equal keys, it now keeps the last one, key
+  and value both, as `BTreeMap` and `BTreeSet` do. Previously the map kept the first key with the
+  last value, and the set kept the first element. `extend` and `insert` are unchanged (#20).
+
 ### Performance
+- `collect`, `from_iter` and `From<[_; N]>` on the map and set now sort the input, then build the
+  tree in O(n) instead of inserting one element at a time: 5–14× faster on 10,000
+  elements, on par with `BTreeMap`/`BTreeSet`. Leaves built from sorted input are now nearly
+  full rather than half full, so the tree uses about half as many nodes (#20).
 - `OSBTreeSet::is_subset` and `is_superset` now return early when the smaller set's bounds fall
   outside the larger set's, or when an O(log n) range count shows the larger set has too few
   elements in that span. Otherwise they choose by size between walking both sets side by side

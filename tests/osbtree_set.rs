@@ -1760,3 +1760,78 @@ fn is_subset_inconsistent_ord_does_not_panic() {
     let _ = a.is_superset(&b);
     FLIP.with(|f| f.set(false));
 }
+
+// ─── Bulk construction (FromIterator) ───────────────────────────────────────
+
+/// An element that compares by `key` alone, so `tag` shows which of several equal ones was kept.
+#[derive(Clone, Copy, Debug)]
+struct Tagged {
+    key: u8,
+    tag: usize,
+}
+
+impl PartialEq for Tagged {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Tagged {}
+
+impl PartialOrd for Tagged {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Tagged {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+fn assert_collect_matches_btreeset(values: &[Tagged]) {
+    let os_set: OSBTreeSet<Tagged> = values.iter().copied().collect();
+    let bt_set: BTreeSet<Tagged> = values.iter().copied().collect();
+    let os_items: Vec<_> = os_set.iter().map(|t| (t.key, t.tag)).collect();
+    let bt_items: Vec<_> = bt_set.iter().map(|t| (t.key, t.tag)).collect();
+    assert_eq!(os_items, bt_items);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Like `BTreeSet`, `collect` keeps the last of each run of equal elements.
+    #[test]
+    fn from_iter_keeps_last_duplicate_like_btreeset(keys in proptest::collection::vec(any::<u8>(), 0..2_000)) {
+        let values: Vec<Tagged> = keys.iter().enumerate().map(|(tag, &key)| Tagged { key, tag }).collect();
+        assert_collect_matches_btreeset(&values);
+
+        let mut sorted = values.clone();
+        sorted.sort_by_key(|t| t.key);
+        assert_collect_matches_btreeset(&sorted);
+
+        sorted.reverse();
+        assert_collect_matches_btreeset(&sorted);
+    }
+}
+
+#[test]
+fn from_array_keeps_last_duplicate() {
+    let set = OSBTreeSet::from([
+        Tagged {
+            key: 2,
+            tag: 0,
+        },
+        Tagged {
+            key: 1,
+            tag: 1,
+        },
+        Tagged {
+            key: 2,
+            tag: 2,
+        },
+    ]);
+    let items: Vec<_> = set.iter().map(|t| (t.key, t.tag)).collect();
+    assert_eq!(items, [(1, 1), (2, 2)]);
+}

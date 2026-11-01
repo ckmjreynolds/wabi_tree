@@ -3093,3 +3093,182 @@ fn terminals_on_empty_and_exhausted_iterators() {
     iter.next_back();
     assert_eq!(iter.max(), Some((998, -998)));
 }
+
+// ─── Bulk construction (FromIterator) ───────────────────────────────────────
+
+/// A key that compares by `key` alone, so `tag` shows which of several equal keys was kept.
+#[derive(Clone, Copy, Debug)]
+struct Tagged {
+    key: u8,
+    tag: usize,
+}
+
+impl PartialEq for Tagged {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Tagged {}
+
+impl PartialOrd for Tagged {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Tagged {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+/// Tags each key with its position in `keys`, and pairs it with an arbitrary value.
+fn tagged_entries(keys: &[u8]) -> Vec<(Tagged, usize)> {
+    keys.iter()
+        .enumerate()
+        .map(|(tag, &key)| {
+            (
+                Tagged {
+                    key,
+                    tag,
+                },
+                tag * 10,
+            )
+        })
+        .collect()
+}
+
+fn assert_collect_matches_btreemap(entries: &[(Tagged, usize)]) {
+    let os_map: OSBTreeMap<Tagged, usize> = entries.iter().copied().collect();
+    let bt_map: BTreeMap<Tagged, usize> = entries.iter().copied().collect();
+    let os_items: Vec<_> = os_map.iter().map(|(k, &v)| (k.key, k.tag, v)).collect();
+    let bt_items: Vec<_> = bt_map.iter().map(|(k, &v)| (k.key, k.tag, v)).collect();
+    assert_eq!(os_items, bt_items);
+    assert_eq!(os_map.len(), bt_map.len());
+    for (rank, (key, _)) in bt_map.iter().enumerate() {
+        assert_eq!(os_map.rank_of(key), Some(rank));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Like `BTreeMap`, `collect` keeps the last of each run of equal keys, key and value both.
+    #[test]
+    fn from_iter_keeps_last_duplicate_like_btreemap(keys in proptest::collection::vec(any::<u8>(), 0..2_000)) {
+        let entries = tagged_entries(&keys);
+        assert_collect_matches_btreemap(&entries);
+
+        let mut sorted = entries.clone();
+        sorted.sort_by_key(|(k, _)| k.key);
+        assert_collect_matches_btreemap(&sorted);
+
+        sorted.reverse();
+        assert_collect_matches_btreemap(&sorted);
+    }
+
+    /// Distinct keys in every order, at sizes that need one or two internal levels.
+    #[test]
+    fn from_iter_of_distinct_keys_matches_btreemap(
+        len in 0usize..40_000,
+        order in prop_oneof![Just(0u8), Just(1u8), Just(2u8)],
+    ) {
+        let mut keys: Vec<u64> = (0..len as u64).collect();
+        match order {
+            0 => {}
+            1 => keys.reverse(),
+            _ => keys.sort_by_key(|&k| k.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        }
+        let os_map: OSBTreeMap<u64, u64> = keys.iter().map(|&k| (k, !k)).collect();
+        prop_assert_eq!(os_map.len(), len);
+        prop_assert!(os_map.iter().map(|(&k, &v)| (k, v)).eq((0..len as u64).map(|k| (k, !k))));
+        prop_assert!(os_map.iter().rev().map(|(&k, _)| k).eq((0..len as u64).rev()));
+        for rank in (0..len).step_by(997) {
+            prop_assert_eq!(os_map.get_by_rank(rank).map(|(&k, _)| k), Some(rank as u64));
+        }
+    }
+}
+
+#[test]
+fn from_array_keeps_last_duplicate() {
+    let map = OSBTreeMap::from([
+        (
+            Tagged {
+                key: 2,
+                tag: 0,
+            },
+            "a",
+        ),
+        (
+            Tagged {
+                key: 1,
+                tag: 1,
+            },
+            "b",
+        ),
+        (
+            Tagged {
+                key: 2,
+                tag: 2,
+            },
+            "c",
+        ),
+    ]);
+    let items: Vec<_> = map.iter().map(|(k, &v)| (k.key, k.tag, v)).collect();
+    assert_eq!(items, [(1, 1, "b"), (2, 2, "c")]);
+}
+
+#[test]
+fn extend_still_keeps_first_key_and_last_value() {
+    // Unlike `collect`, `extend` goes through `insert`, which keeps the existing key.
+    let mut map = OSBTreeMap::new();
+    map.extend([
+        (
+            Tagged {
+                key: 1,
+                tag: 0,
+            },
+            "a",
+        ),
+        (
+            Tagged {
+                key: 1,
+                tag: 1,
+            },
+            "b",
+        ),
+    ]);
+    let items: Vec<_> = map.iter().map(|(k, &v)| (k.key, k.tag, v)).collect();
+    assert_eq!(items, [(1, 0, "b")]);
+}
+
+/// A value that counts its drops.
+struct DropCounter(std::rc::Rc<std::cell::Cell<usize>>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+#[test]
+fn panicking_key_clone_during_collect_drops_every_entry_once() {
+    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+    // Enough entries for several leaves, so building the internal level clones separators.
+    let entries: Vec<_> = (0..2_000u32).rev().map(|i| (PanickyKey(i), DropCounter(drops.clone()))).collect();
+    assert!(with_panicking_clone(|| {
+        let _map: OSBTreeMap<_, _> = entries.into_iter().collect();
+    }));
+    assert_eq!(drops.get(), 2_000);
+}
+
+#[test]
+fn collect_drops_discarded_duplicates_once() {
+    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+    let map: OSBTreeMap<_, _> = (0..3_000u32).map(|i| (i % 1_000, DropCounter(drops.clone()))).collect();
+    assert_eq!(map.len(), 1_000);
+    assert_eq!(drops.get(), 2_000);
+    drop(map);
+    assert_eq!(drops.get(), 3_000);
+}

@@ -1407,10 +1407,19 @@ impl<T> Default for OSBTreeSet<T> {
 }
 
 impl<T: Ord + Clone> FromIterator<T> for OSBTreeSet<T> {
+    /// Creates a set from the elements of `iter`.
+    ///
+    /// If `iter` yields equal elements more than once, the last of them is kept, as with
+    /// [`BTreeSet`](alloc::collections::BTreeSet).
+    ///
+    /// # Complexity
+    ///
+    /// O(n log n) to sort the elements, then O(n) to build the tree. Input already in order
+    /// sorts in O(n).
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut set = OSBTreeSet::new();
-        set.extend(iter);
-        set
+        OSBTreeSet {
+            map: iter.into_iter().map(|value| (value, ())).collect(),
+        }
     }
 }
 

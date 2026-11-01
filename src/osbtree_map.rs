@@ -1597,10 +1597,31 @@ impl<K, V> Default for OSBTreeMap<K, V> {
 }
 
 impl<K: Ord + Clone, V> FromIterator<(K, V)> for OSBTreeMap<K, V> {
+    /// Creates a map from the key-value pairs of `iter`.
+    ///
+    /// If `iter` yields the same key more than once, the last such pair (key and value) is
+    /// kept, as with [`BTreeMap`](alloc::collections::BTreeMap).
+    ///
+    /// # Complexity
+    ///
+    /// O(n log n) to sort the pairs, then O(n) to build the tree. Input already in key order
+    /// sorts in O(n).
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
-        let mut map = OSBTreeMap::new();
-        map.extend(iter);
-        map
+        let mut entries: alloc::vec::Vec<(K, V)> = iter.into_iter().collect();
+        if entries.len() > 1 {
+            // A stable sort keeps duplicates in input order; the dedup then keeps the last.
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries.dedup_by(|later, kept| {
+                let duplicate = later.0 == kept.0;
+                if duplicate {
+                    core::mem::swap(later, kept);
+                }
+                duplicate
+            });
+        }
+        OSBTreeMap {
+            raw: RawOSBTreeMap::from_sorted_iter(entries),
+        }
     }
 }
 
