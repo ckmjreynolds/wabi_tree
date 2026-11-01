@@ -120,6 +120,16 @@ impl<K> Node<K> {
             Node::Leaf(leaf) => leaf.key_count(),
         }
     }
+    /// Returns true if any of the node's buffers outgrew its inline capacity and moved to the
+    /// heap. A node never holds more than one entry over its maximum, so this should not happen.
+    #[cfg(test)]
+    pub(crate) fn spilled(&self) -> bool {
+        match self {
+            Node::Internal(n) => n.keys.spilled() || n.children.spilled() || n.child_sizes.spilled(),
+            Node::Leaf(n) => n.keys.spilled() || n.values.spilled(),
+        }
+    }
+
     /// Returns the number of key/value pairs in the subtree rooted at this node.
     pub(crate) fn subtree_size(&self) -> Size {
         match self {
@@ -575,14 +585,6 @@ impl<K> LeafNode<K> {
         }
     }
 
-    /// Takes ownership of all keys and value handles, leaving the leaf empty.
-    #[cfg(test)]
-    pub(crate) fn take_all(&mut self) -> (SmallVec<[K; MAX_KEYS + 1]>, SmallVec<[Handle; MAX_KEYS + 1]>) {
-        let keys = core::mem::take(&mut self.keys);
-        let values = core::mem::take(&mut self.values);
-        (keys, values)
-    }
-
     /// Splits this leaf at the midpoint. Returns (`split_key`, `new_node`).
     /// The `split_key` is the last key in the left (current) node.
     pub(crate) fn split(&mut self) -> (K, LeafNode<K>)
@@ -591,14 +593,12 @@ impl<K> LeafNode<K> {
     {
         // The split key is the last key in the left node (for B+tree separator). Clone it before
         // moving anything, so a panicking `K::clone` leaves this leaf intact.
-        let split_key = self.keys[Self::split_index(self.keys.len()) - 1].clone();
-        (split_key, self.split_half())
-    }
-
-    /// Where [`Self::split`] and [`Self::split_half`] divide a leaf of `len` entries: the
-    /// right half starts at this index.
-    pub(crate) const fn split_index(len: usize) -> usize {
-        len / 2
+        let mid = self.keys.len() / 2;
+        let split_key = self.keys[mid - 1].clone();
+        let mut right = LeafNode::new();
+        right.keys = self.keys.drain(mid..).collect();
+        right.values = self.values.drain(mid..).collect();
+        (split_key, right)
     }
 
     /// Merges with a right sibling.
@@ -606,6 +606,11 @@ impl<K> LeafNode<K> {
         self.keys.append(&mut right.keys);
         self.values.append(&mut right.values);
         self.next = right.next;
+    }
+
+    /// Replaces the key at `index` with one that compares equal, returning the old one.
+    pub(crate) fn replace_key(&mut self, index: usize, key: K) -> K {
+        core::mem::replace(&mut self.keys[index], key)
     }
 
     /// Removes the entries in `range`, yielding each key with its value handle.
@@ -633,16 +638,6 @@ impl<K> LeafNode<K> {
     pub(crate) fn extend(&mut self, (keys, values): LeafEntries<K>) {
         self.keys.extend(keys);
         self.values.extend(values);
-    }
-
-    /// Splits this leaf at the midpoint, as [`Self::split`] does, but without cloning the
-    /// separator: the caller supplies it (a clone of the left half's last key).
-    pub(crate) fn split_half(&mut self) -> LeafNode<K> {
-        let mid = Self::split_index(self.keys.len());
-        let mut right = LeafNode::new();
-        right.keys = self.keys.drain(mid..).collect();
-        right.values = self.values.drain(mid..).collect();
-        right
     }
 }
 

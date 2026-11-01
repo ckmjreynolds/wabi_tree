@@ -1032,9 +1032,10 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// With m the size of `other` and n the size of `self`:
     ///
-    /// - O(min(n, m) + log(n + m)) when every key in `other` is greater than every key in
-    ///   `self`, or every one is less: the smaller tree is grafted onto the larger.
-    /// - O(m log(n + m)) when the key ranges overlap and `other` is much smaller.
+    /// - O(min(n, m) + log(n + m)) amortized when every key in `other` is greater than every
+    ///   key in `self`, or every one is less: the smaller tree is grafted onto the larger.
+    /// - O(min(n, m) log(n + m)) when the key ranges overlap and one map is much smaller: its
+    ///   entries are inserted into the other.
     /// - O(n + m) when the key ranges overlap and the sizes are similar: both are merged and
     ///   the tree is rebuilt.
     pub fn append(&mut self, other: &mut Self)
@@ -2384,8 +2385,8 @@ mod tests {
         let first = map.raw.first_leaf().expect("non-empty map has a first leaf");
         let last = map.raw.last_leaf().expect("non-empty map has a last leaf");
 
-        let _ = map.raw.node_mut(first).as_leaf_mut().take_all();
-        let _ = map.raw.node_mut(last).as_leaf_mut().take_all();
+        map.raw.node_mut(first).as_leaf_mut().drain(..).for_each(drop);
+        map.raw.node_mut(last).as_leaf_mut().drain(..).for_each(drop);
 
         assert!(map.first_entry().is_none());
         assert!(map.last_entry().is_none());

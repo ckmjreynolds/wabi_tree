@@ -721,6 +721,18 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
     /// and the old value if the key was already present. Value handles are stable across
     /// node splits, so the handle stays valid until the entry is removed.
     pub(crate) fn insert_with_handle(&mut self, key: K, value: V) -> (Handle, Option<V>) {
+        self.insert_impl(key, value, false)
+    }
+
+    /// Inserts a key-value pair, but if an equal key is present, replaces only the key and keeps
+    /// the stored value. Returns `value` if it was not stored.
+    pub(crate) fn insert_key_keep_value(&mut self, key: K, value: V) -> Option<V> {
+        self.insert_impl(key, value, true).1
+    }
+
+    /// Inserts `key` and `value`. If an equal key is present, `keep_value` chooses between
+    /// replacing the value (returning the old one) and replacing the key (returning `value`).
+    fn insert_impl(&mut self, key: K, value: V, keep_value: bool) -> (Handle, Option<V>) {
         let Some(root) = self.root else {
             let value_handle = self.values.alloc(value);
             let mut leaf = LeafNode::new();
@@ -740,8 +752,13 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         let leaf = self.nodes.get_mut(current).as_leaf_mut();
         match leaf.search(&key) {
             SearchResult::Found(idx) => {
-                // Key exists, replace value in-place to avoid alloc/free churn
                 let value_handle = leaf.value(idx);
+                if keep_value {
+                    // An equal key compares the same as the old one, so separators stay valid.
+                    leaf.replace_key(idx, key);
+                    return (value_handle, Some(value));
+                }
+                // Key exists, replace value in-place to avoid alloc/free churn
                 let old_value = core::mem::replace(self.values.get_mut(value_handle), value);
                 (value_handle, Some(old_value))
             }
@@ -2046,9 +2063,9 @@ mod tests {
         let mid_key = *tree.node(mid).as_leaf().key(0);
 
         // Create empty neighbors around `mid` to exercise empty-leaf fallbacks.
-        let _ = tree.node_mut(prev).as_leaf_mut().take_all();
-        let _ = tree.node_mut(mid).as_leaf_mut().take_all();
-        let _ = tree.node_mut(next).as_leaf_mut().take_all();
+        tree.node_mut(prev).as_leaf_mut().drain(..).for_each(drop);
+        tree.node_mut(mid).as_leaf_mut().drain(..).for_each(drop);
+        tree.node_mut(next).as_leaf_mut().drain(..).for_each(drop);
 
         // With an empty next leaf, lower/upper bounds should return None here.
         assert_eq!(tree.lower_bound(&mid_key), None);
@@ -2148,8 +2165,8 @@ mod tests {
 
         let first = tree.first_leaf().expect("first leaf exists");
         let last = tree.last_leaf().expect("last leaf exists");
-        let _ = tree.node_mut(first).as_leaf_mut().take_all();
-        let _ = tree.node_mut(last).as_leaf_mut().take_all();
+        tree.node_mut(first).as_leaf_mut().drain(..).for_each(drop);
+        tree.node_mut(last).as_leaf_mut().drain(..).for_each(drop);
 
         assert_eq!(tree.first_key_value(), None);
         assert_eq!(tree.last_key_value(), None);
@@ -2184,7 +2201,7 @@ mod tests {
     #[test]
     fn upper_bound_returns_none_when_next_leaf_is_empty() {
         let (mut tree, _root, _left, right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
-        let _ = tree.node_mut(right).as_leaf_mut().take_all();
+        tree.node_mut(right).as_leaf_mut().drain(..).for_each(drop);
 
         // Found at the last index with an empty next leaf should return None.
         assert_eq!(tree.upper_bound(&4), None);
@@ -2193,7 +2210,7 @@ mod tests {
     #[test]
     fn lower_bound_exclusive_returns_none_when_prev_leaf_is_empty() {
         let (mut tree, _root, left, _right) = make_two_leaf_tree(&[0, 2, 4], &[6, 8, 10]);
-        let _ = tree.node_mut(left).as_leaf_mut().take_all();
+        tree.node_mut(left).as_leaf_mut().drain(..).for_each(drop);
 
         // Found at index 0 with an empty previous leaf should return None.
         assert_eq!(tree.lower_bound_exclusive(&6), None);

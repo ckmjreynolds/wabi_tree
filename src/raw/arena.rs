@@ -42,6 +42,12 @@ impl<T> Arena<T> {
         self.slots.len()
     }
 
+    /// Iterates over the live elements.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().flatten()
+    }
+
     #[cfg(test)]
     pub(crate) const fn is_empty(&self) -> bool {
         self.len() == 0

@@ -3309,8 +3309,9 @@ fn append_tagged(a: &[u8], b: &[u8]) -> (TaggedTriples, TaggedTriples) {
 fn append_equal_keys_keep_key_from_self_and_value_from_other() {
     let evens: Vec<u8> = (0..=254).step_by(2).collect();
     let all: Vec<u8> = (0..=255).collect();
-    // A few keys into many (inserted one at a time), and similar sizes (merged and rebuilt).
-    for (a, b) in [(&all, &vec![3u8, 4, 200]), (&evens, &all), (&all, &evens), (&all, &all)] {
+    let few = vec![3u8, 4, 200];
+    // Few into many, many into few (inserted the other way round), and similar sizes (merged).
+    for (a, b) in [(&all, &few), (&few, &all), (&evens, &all), (&all, &evens), (&all, &all)] {
         let (os, bt) = append_tagged(a, b);
         assert_eq!(os, bt);
     }

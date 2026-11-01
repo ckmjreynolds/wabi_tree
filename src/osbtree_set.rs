@@ -1190,9 +1190,10 @@ impl<T> OSBTreeSet<T> {
     ///
     /// With m the size of `other` and n the size of `self`:
     ///
-    /// - O(min(n, m) + log(n + m)) when every value in `other` is greater than every value in
-    ///   `self`, or every one is less: the smaller tree is grafted onto the larger.
-    /// - O(m log(n + m)) when the ranges overlap and `other` is much smaller.
+    /// - O(min(n, m) + log(n + m)) amortized when every value in `other` is greater than every
+    ///   value in `self`, or every one is less: the smaller tree is grafted onto the larger.
+    /// - O(min(n, m) log(n + m)) when the ranges overlap and one set is much smaller: its values
+    ///   are inserted into the other.
     /// - O(n + m) when the ranges overlap and the sizes are similar: both are merged and the
     ///   tree is rebuilt.
     pub fn append(&mut self, other: &mut Self)
