@@ -1506,18 +1506,24 @@ impl<'a, T> Iterator for Iter<'a, T> {
         self.inner.next()
     }
 
+    fn nth(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth(n)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
 
-    fn last(mut self) -> Option<&'a T> {
-        self.next_back()
-    }
+    o1_terminals!(sorted);
 }
 
 impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
     fn next_back(&mut self) -> Option<&'a T> {
         self.inner.next_back()
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth_back(n)
     }
 }
 
@@ -1565,14 +1571,24 @@ impl<T: Clone + Ord> Iterator for IntoIter<T> {
         self.inner.next()
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<T: Clone + Ord> DoubleEndedIterator for IntoIter<T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back()
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n)
     }
 }
 
@@ -1612,14 +1628,43 @@ impl<'a, T> Iterator for Range<'a, T> {
         self.inner.next().map(|(k, ())| k)
     }
 
+    fn nth(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth(n).map(|(k, ())| k)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<'a, T> DoubleEndedIterator for Range<'a, T> {
     fn next_back(&mut self) -> Option<&'a T> {
         self.inner.next_back().map(|(k, ())| k)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth_back(n).map(|(k, ())| k)
+    }
+}
+
+impl<T> ExactSizeIterator for Range<'_, T> {
+    /// Returns the number of elements remaining in the range.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wabi_tree::OSBTreeSet;
+    ///
+    /// let set = OSBTreeSet::from([1, 2, 3, 4, 5]);
+    /// let mut range = set.range(2..5);
+    /// assert_eq!(range.len(), 3);
+    /// range.next_back();
+    /// assert_eq!(range.len(), 2);
+    /// ```
+    fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 

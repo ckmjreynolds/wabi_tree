@@ -6,6 +6,22 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-01
+
+### Added
+- `osbtree_set::Range` now implements `ExactSizeIterator`, matching `osbtree_map::Range` (#19).
+
+### Performance
+- `nth` and `nth_back` on the map and set iterators (including ranges) jump by rank instead of
+  stepping one element at a time, so `iter().skip(n)`, `rev().skip(n)` and `step_by` cost
+  O(log n) per jump rather than O(n) (#18).
+- `last` and `count` answer in O(1) instead of walking every remaining element on the map's
+  `iter`, `iter_mut`, `into_iter`, `keys`, `values`, `values_mut`, `into_keys`, `into_values`,
+  `range` and `range_mut` and the set's `iter`, `into_iter` and `range`, e.g. `map.keys().last()`
+  or `set.range(a..b).count()` (#19). `min` and `max` do too on those whose items are sorted:
+  all of them except `values`, `values_mut` and `into_values`. The set-operation iterators
+  (`difference`, `intersection`, etc.) and `extract_if` are unchanged.
+
 ## [0.1.3] - 2026-10-18
 
 ### Fixed

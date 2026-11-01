@@ -6,7 +6,7 @@ use core::iter::FusedIterator;
 use core::marker::PhantomData;
 use core::ops::{Bound, Index, RangeBounds};
 
-use crate::raw::{Handle, RangeCursor, RawOSBTreeMap};
+use crate::raw::{Handle, RangeCursor, RawOSBTreeMap, Span};
 
 mod capacity;
 mod entry;
@@ -206,11 +206,7 @@ pub struct OSBTreeMap<K, V> {
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Iter<'a, K, V> {
     tree: *const RawOSBTreeMap<K, V>,
-    front_leaf: Option<Handle>,
-    front_index: usize,
-    back_leaf: Option<Handle>,
-    back_index: usize,
-    remaining: usize,
+    span: Span,
     _marker: PhantomData<&'a RawOSBTreeMap<K, V>>,
 }
 
@@ -240,11 +236,7 @@ unsafe impl<K: Sync, V: Sync> Sync for Iter<'_, K, V> {}
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IterMut<'a, K: 'a, V: 'a> {
     tree: *mut RawOSBTreeMap<K, V>,
-    front_leaf: Option<Handle>,
-    front_index: usize,
-    back_leaf: Option<Handle>,
-    back_index: usize,
-    remaining: usize,
+    span: Span,
     _marker: PhantomData<&'a mut (K, V)>,
 }
 
@@ -412,20 +404,8 @@ pub struct IntoValues<K, V> {
 /// [`range`]: OSBTreeMap::range
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Range<'a, K: 'a, V: 'a> {
-    tree: *const RawOSBTreeMap<K, V>,
-    front_leaf: Option<Handle>,
-    front_index: usize,
-    back_leaf: Option<Handle>,
-    back_index: usize,
-    remaining: usize,
-    /// Tracks whether the iterator has been exhausted (front and back have crossed).
-    finished: bool,
-    _marker: PhantomData<&'a RawOSBTreeMap<K, V>>,
+    inner: Iter<'a, K, V>,
 }
-
-// SAFETY: Range behaves as &RawOSBTreeMap<K, V>, so it is Send/Sync when the tree is Sync.
-unsafe impl<K: Sync, V: Sync> Send for Range<'_, K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for Range<'_, K, V> {}
 
 /// A mutable iterator over a sub-range of entries in a `OSBTreeMap`.
 ///
@@ -449,20 +429,8 @@ unsafe impl<K: Sync, V: Sync> Sync for Range<'_, K, V> {}
 /// [`range_mut`]: OSBTreeMap::range_mut
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct RangeMut<'a, K: 'a, V: 'a> {
-    tree: *mut RawOSBTreeMap<K, V>,
-    front_leaf: Option<Handle>,
-    front_index: usize,
-    back_leaf: Option<Handle>,
-    back_index: usize,
-    remaining: usize,
-    /// Tracks whether the iterator has been exhausted (front and back have crossed).
-    finished: bool,
-    _marker: PhantomData<&'a mut (K, V)>,
+    inner: IterMut<'a, K, V>,
 }
-
-// SAFETY: RangeMut behaves as &mut RawOSBTreeMap<K, V>, so it is Send when K and V are Send.
-// It is NOT Sync because mutable iterators should not be shared across threads.
-unsafe impl<K: Send, V: Send> Send for RangeMut<'_, K, V> {}
 
 /// An iterator produced by calling `extract_if` on `OSBTreeMap`.
 ///
@@ -1123,7 +1091,9 @@ impl<K, V> OSBTreeMap<K, V> {
         R: RangeBounds<T>,
     {
         validate_range_bounds(&range);
-        Range::from_cursor(&raw const self.raw, self.raw.range_cursor(&range))
+        Range {
+            inner: Iter::from_cursor(&raw const self.raw, self.raw.range_cursor(&range)),
+        }
     }
 
     /// Constructs a mutable double-ended iterator over a sub-range of elements in the map.
@@ -1164,7 +1134,9 @@ impl<K, V> OSBTreeMap<K, V> {
     {
         validate_range_bounds(&range);
         let cursor = self.raw.range_cursor(&range);
-        RangeMut::from_cursor(&raw mut self.raw, cursor)
+        RangeMut {
+            inner: IterMut::from_cursor(&raw mut self.raw, cursor),
+        }
     }
 
     /// Gets the given key's corresponding entry in the map for in-place manipulation.
@@ -1413,15 +1385,10 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// O(1) to create the iterator; O(1) per iteration step via linked leaves.
     pub fn iter(&self) -> Iter<'_, K, V> {
-        let first_leaf = self.raw.first_leaf();
-        let (back_leaf, back_index) = self.raw.last_position().unzip();
+        let span = Span::new(self.raw.full_cursor());
         Iter {
             tree: &raw const self.raw,
-            front_leaf: first_leaf,
-            front_index: 0,
-            back_leaf,
-            back_index: back_index.unwrap_or(0),
-            remaining: self.raw.len(),
+            span,
             _marker: PhantomData,
         }
     }
@@ -1451,15 +1418,10 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// O(1) to create the iterator; O(1) per iteration step via linked leaves.
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
-        let first_leaf = self.raw.first_leaf();
-        let (back_leaf, back_index) = self.raw.last_position().unzip();
+        let span = Span::new(self.raw.full_cursor());
         IterMut {
             tree: &raw mut self.raw,
-            front_leaf: first_leaf,
-            front_index: 0,
-            back_leaf,
-            back_index: back_index.unwrap_or(0),
-            remaining: self.raw.len(),
+            span,
             _marker: PhantomData,
         }
     }
@@ -1718,78 +1680,61 @@ impl<K: Ord + Clone, V, const N: usize> From<[(K, V); N]> for OSBTreeMap<K, V> {
     }
 }
 
+impl<'a, K: 'a, V: 'a> Iter<'a, K, V> {
+    /// Creates an iterator over the elements `cursor` resolved in `tree`.
+    fn from_cursor(tree: *const RawOSBTreeMap<K, V>, cursor: RangeCursor) -> Self {
+        Iter {
+            tree,
+            span: Span::new(cursor),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns the entry at `(leaf, index)`, a position the span has just popped.
+    fn entry(&self, (leaf, index): (Handle, usize)) -> (&'a K, &'a V) {
+        // SAFETY: the span pops a position only while elements remain, and then `self.tree`
+        // points to the tree this iterator borrows for `'a`.
+        let tree = unsafe { &*self.tree };
+        let leaf = tree.node(leaf).as_leaf();
+        (leaf.key(index), tree.value(leaf.value(index)))
+    }
+}
+
 impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
+        // SAFETY: the tree outlives this iterator and is unmodified while it lives.
+        unsafe { self.span.pop_front(self.tree) }.map(|pos| self.entry(pos))
+    }
 
-        let leaf_handle = self.front_leaf?;
-
-        // SAFETY: When remaining > 0 and front_leaf is Some, self.tree is a valid pointer
-        // obtained from a live reference in iter().
-        let tree = unsafe { &*self.tree };
-        let leaf = tree.node(leaf_handle).as_leaf();
-
-        let key = leaf.key(self.front_index);
-        let value_handle = leaf.value(self.front_index);
-        let value = tree.value(value_handle);
-
-        self.remaining -= 1;
-        self.front_index += 1;
-
-        // Move to next leaf if needed
-        if self.front_index >= leaf.key_count() {
-            self.front_leaf = leaf.next();
-            self.front_index = 0;
-        }
-
-        Some((key, value))
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        // SAFETY: as in `next`.
+        unsafe { self.span.nth_front(self.tree, n) }.map(|pos| self.entry(pos))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        (self.span.len(), Some(self.span.len()))
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<'a, K: 'a, V: 'a> DoubleEndedIterator for Iter<'a, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
+        // SAFETY: as in `next`.
+        unsafe { self.span.pop_back(self.tree) }.map(|pos| self.entry(pos))
+    }
 
-        let leaf_handle = self.back_leaf?;
-
-        // SAFETY: When remaining > 0 and back_leaf is Some, self.tree is a valid pointer.
-        let tree = unsafe { &*self.tree };
-        let leaf = tree.node(leaf_handle).as_leaf();
-
-        let key = leaf.key(self.back_index);
-        let value_handle = leaf.value(self.back_index);
-        let value = tree.value(value_handle);
-
-        self.remaining -= 1;
-
-        // Move to previous element/leaf
-        if self.back_index == 0 {
-            self.back_leaf = leaf.prev();
-            if let Some(prev_handle) = self.back_leaf {
-                let prev_leaf = tree.node(prev_handle).as_leaf();
-                self.back_index = prev_leaf.key_count().saturating_sub(1);
-            }
-        } else {
-            self.back_index -= 1;
-        }
-
-        Some((key, value))
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        // SAFETY: as in `next`.
+        unsafe { self.span.nth_back(self.tree, n) }.map(|pos| self.entry(pos))
     }
 }
 
 impl<K, V> ExactSizeIterator for Iter<'_, K, V> {
     fn len(&self) -> usize {
-        self.remaining
+        self.span.len()
     }
 }
 
@@ -1797,7 +1742,7 @@ impl<K, V> FusedIterator for Iter<'_, K, V> {}
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Iter<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Iter").field("remaining", &self.remaining).finish()
+        f.debug_struct("Iter").field("remaining", &self.span.len()).finish()
     }
 }
 
@@ -1810,17 +1755,8 @@ impl<'a, K: 'a, V: 'a> Default for Iter<'a, K, V> {
     /// assert_eq!(iter.len(), 0);
     /// ```
     fn default() -> Self {
-        Iter {
-            // SAFETY: tree is never dereferenced when remaining == 0 and front_leaf/back_leaf
-            // are None, so a dangling pointer is safe here.
-            tree: core::ptr::NonNull::dangling().as_ptr(),
-            front_leaf: None,
-            front_index: 0,
-            back_leaf: None,
-            back_index: 0,
-            remaining: 0,
-            _marker: PhantomData,
-        }
+        // SAFETY: an empty span never dereferences the tree pointer, so a dangling one is safe.
+        Iter::from_cursor(core::ptr::NonNull::dangling().as_ptr(), RangeCursor::default())
     }
 }
 
@@ -1828,12 +1764,34 @@ impl<K, V> Clone for Iter<'_, K, V> {
     fn clone(&self) -> Self {
         Iter {
             tree: self.tree,
-            front_leaf: self.front_leaf,
-            front_index: self.front_index,
-            back_leaf: self.back_leaf,
-            back_index: self.back_index,
-            remaining: self.remaining,
+            span: self.span.clone(),
             _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, K: 'a, V: 'a> IterMut<'a, K, V> {
+    /// Creates an iterator over the elements `cursor` resolved in `tree`.
+    fn from_cursor(tree: *mut RawOSBTreeMap<K, V>, cursor: RangeCursor) -> Self {
+        IterMut {
+            tree,
+            span: Span::new(cursor),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns the entry at `(leaf, index)`, a position the span has just popped.
+    ///
+    /// # Safety
+    /// `self.tree` must be valid, which holds whenever the span has just popped a position.
+    unsafe fn entry(&self, (leaf, index): (Handle, usize)) -> (&'a K, &'a mut V) {
+        // SAFETY: We have exclusive access to the tree through the raw pointer, and the span
+        // pops each position at most once, so no value is handed out twice. Keys live in the
+        // nodes arena and values in the values arena (separate allocations), and we reach them
+        // through separate raw pointers to avoid aliasing violations.
+        unsafe {
+            let leaf = RawOSBTreeMap::node_ptr(self.tree, leaf).as_leaf();
+            (leaf.key(index), RawOSBTreeMap::value_mut_ptr(self.tree, leaf.value(index)))
         }
     }
 }
@@ -1842,82 +1800,38 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
+        // SAFETY: the tree outlives this iterator and is unmodified while it lives, and the
+        // position was just popped.
+        unsafe { self.span.pop_front(self.tree).map(|pos| self.entry(pos)) }
+    }
 
-        let leaf_handle = self.front_leaf?;
-
-        // SAFETY: We have exclusive access to the tree through the raw pointer.
-        // We're traversing elements in order and never visit the same element twice.
-        // Keys live in the nodes arena and values in the values arena (separate allocations).
-        // We access nodes and values through separate raw pointers to avoid aliasing violations.
-        unsafe {
-            let leaf = RawOSBTreeMap::node_ptr(self.tree, leaf_handle).as_leaf();
-
-            let key = leaf.key(self.front_index);
-            let value_handle = leaf.value(self.front_index);
-
-            // Access value through raw pointer to the values arena only.
-            let value = RawOSBTreeMap::value_mut_ptr(self.tree, value_handle);
-
-            self.remaining -= 1;
-            self.front_index += 1;
-
-            // Move to next leaf if needed
-            if self.front_index >= leaf.key_count() {
-                self.front_leaf = leaf.next();
-                self.front_index = 0;
-            }
-
-            Some((key, value))
-        }
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        // SAFETY: as in `next`.
+        unsafe { self.span.nth_front(self.tree, n).map(|pos| self.entry(pos)) }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        (self.span.len(), Some(self.span.len()))
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for IterMut<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
+        // SAFETY: as in `next`.
+        unsafe { self.span.pop_back(self.tree).map(|pos| self.entry(pos)) }
+    }
 
-        let leaf_handle = self.back_leaf?;
-
-        // SAFETY: Same as in next() - we have exclusive access and never visit same element twice.
-        // Keys and values are in separate arenas, accessed independently via raw pointers.
-        unsafe {
-            let leaf = RawOSBTreeMap::node_ptr(self.tree, leaf_handle).as_leaf();
-
-            let key = leaf.key(self.back_index);
-            let value_handle = leaf.value(self.back_index);
-
-            let value = RawOSBTreeMap::value_mut_ptr(self.tree, value_handle);
-
-            self.remaining -= 1;
-
-            // Move to previous element/leaf
-            if self.back_index == 0 {
-                self.back_leaf = leaf.prev();
-                if let Some(prev_handle) = self.back_leaf {
-                    let prev_leaf = RawOSBTreeMap::node_ptr(self.tree, prev_handle).as_leaf();
-                    self.back_index = prev_leaf.key_count().saturating_sub(1);
-                }
-            } else {
-                self.back_index -= 1;
-            }
-
-            Some((key, value))
-        }
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        // SAFETY: as in `next`.
+        unsafe { self.span.nth_back(self.tree, n).map(|pos| self.entry(pos)) }
     }
 }
 
 impl<K, V> ExactSizeIterator for IterMut<'_, K, V> {
     fn len(&self) -> usize {
-        self.remaining
+        self.span.len()
     }
 }
 
@@ -1925,7 +1839,7 @@ impl<K, V> FusedIterator for IterMut<'_, K, V> {}
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IterMut").field("remaining", &self.remaining).finish()
+        f.debug_struct("IterMut").field("remaining", &self.span.len()).finish()
     }
 }
 
@@ -1938,17 +1852,8 @@ impl<'a, K: 'a, V: 'a> Default for IterMut<'a, K, V> {
     /// assert_eq!(iter.len(), 0);
     /// ```
     fn default() -> Self {
-        IterMut {
-            // SAFETY: tree is never dereferenced when remaining == 0 and front_leaf/back_leaf
-            // are None, so a dangling pointer is safe here.
-            tree: core::ptr::NonNull::dangling().as_ptr(),
-            front_leaf: None,
-            front_index: 0,
-            back_leaf: None,
-            back_index: 0,
-            remaining: 0,
-            _marker: PhantomData,
-        }
+        // SAFETY: an empty span never dereferences the tree pointer, so a dangling one is safe.
+        IterMut::from_cursor(core::ptr::NonNull::dangling().as_ptr(), RangeCursor::default())
     }
 }
 
@@ -1959,14 +1864,24 @@ impl<K, V> Iterator for IntoIter<K, V> {
         self.inner.next()
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back()
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n)
     }
 }
 
@@ -2006,14 +1921,24 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
         self.inner.next().map(|(k, _)| k)
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|(k, _)| k)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for Keys<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back().map(|(k, _)| k)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n).map(|(k, _)| k)
     }
 }
 
@@ -2027,7 +1952,7 @@ impl<K, V> FusedIterator for Keys<'_, K, V> {}
 
 impl<K: fmt::Debug, V> fmt::Debug for Keys<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Keys").field("remaining", &self.inner.remaining).finish()
+        f.debug_struct("Keys").field("remaining", &self.inner.len()).finish()
     }
 }
 
@@ -2061,18 +1986,24 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
         self.inner.next().map(|(_, v)| v)
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|(_, v)| v)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
 
-    fn last(mut self) -> Option<Self::Item> {
-        self.next_back()
-    }
+    o1_terminals!();
 }
 
 impl<K, V> DoubleEndedIterator for Values<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back().map(|(_, v)| v)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n).map(|(_, v)| v)
     }
 }
 
@@ -2109,7 +2040,7 @@ impl<K, V> Default for Values<'_, K, V> {
 
 impl<K, V: fmt::Debug> fmt::Debug for Values<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Values").field("remaining", &self.inner.remaining).finish()
+        f.debug_struct("Values").field("remaining", &self.inner.len()).finish()
     }
 }
 
@@ -2120,18 +2051,24 @@ impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
         self.inner.next().map(|(_, v)| v)
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|(_, v)| v)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
 
-    fn last(mut self) -> Option<Self::Item> {
-        self.next_back()
-    }
+    o1_terminals!();
 }
 
 impl<K, V> DoubleEndedIterator for ValuesMut<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back().map(|(_, v)| v)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n).map(|(_, v)| v)
     }
 }
 
@@ -2145,7 +2082,7 @@ impl<K, V> FusedIterator for ValuesMut<'_, K, V> {}
 
 impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ValuesMut").field("remaining", &self.inner.remaining).finish()
+        f.debug_struct("ValuesMut").field("remaining", &self.inner.len()).finish()
     }
 }
 
@@ -2171,14 +2108,24 @@ impl<K: Clone + Ord, V> Iterator for IntoKeys<K, V> {
         self.inner.next().map(|(k, _)| k)
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|(k, _)| k)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K: Clone + Ord, V> DoubleEndedIterator for IntoKeys<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back().map(|(k, _)| k)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n).map(|(k, _)| k)
     }
 }
 
@@ -2218,14 +2165,24 @@ impl<K: Clone + Ord, V> Iterator for IntoValues<K, V> {
         self.inner.next().map(|(_, v)| v)
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|(_, v)| v)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    o1_terminals!();
 }
 
 impl<K: Clone + Ord, V> DoubleEndedIterator for IntoValues<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back().map(|(_, v)| v)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n).map(|(_, v)| v)
     }
 }
 
@@ -2258,120 +2215,31 @@ impl<K, V> Default for IntoValues<K, V> {
     }
 }
 
-impl<K, V> Range<'_, K, V> {
-    /// Creates a range iterator over the positions resolved by `cursor`.
-    fn from_cursor(tree: *const RawOSBTreeMap<K, V>, cursor: RangeCursor) -> Self {
-        Range {
-            tree,
-            front_leaf: cursor.front_leaf,
-            front_index: cursor.front_index,
-            back_leaf: cursor.back_leaf,
-            back_index: cursor.back_index,
-            remaining: cursor.len,
-            finished: cursor.len == 0,
-            _marker: PhantomData,
-        }
-    }
-}
-
 impl<'a, K, V> Iterator for Range<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Check if we've already exhausted the range
-        if self.finished {
-            return None;
-        }
+        self.inner.next()
+    }
 
-        let front_leaf = self.front_leaf?;
-        let back_leaf = self.back_leaf?;
-
-        // Check if front has passed back (same leaf, front index > back index)
-        if front_leaf == back_leaf && self.front_index > self.back_index {
-            self.finished = true;
-            return None;
-        }
-
-        // Check if this is the last element (front and back at same position)
-        let is_last = front_leaf == back_leaf && self.front_index == self.back_index;
-
-        // SAFETY: When the range is not finished and leaves are Some, self.tree is a valid pointer.
-        let tree = unsafe { &*self.tree };
-        let leaf = tree.node(front_leaf).as_leaf();
-        let key = leaf.key(self.front_index);
-        let value_handle = leaf.value(self.front_index);
-        let value = tree.value(value_handle);
-
-        // Advance front position
-        self.front_index += 1;
-        if self.front_index >= leaf.key_count() {
-            self.front_leaf = leaf.next();
-            self.front_index = 0;
-        }
-
-        if is_last {
-            self.finished = true;
-        }
-
-        if self.remaining > 0 {
-            self.remaining -= 1;
-        }
-
-        Some((key, value))
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // Exact count is known via order statistics
-        (self.remaining, Some(self.remaining))
+        self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for Range<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        // Check if we've already exhausted the range
-        if self.finished {
-            return None;
-        }
+        self.inner.next_back()
+    }
 
-        let front_leaf = self.front_leaf?;
-        let back_leaf = self.back_leaf?;
-
-        // Check if back has passed front (same leaf, back index < front index)
-        if front_leaf == back_leaf && self.back_index < self.front_index {
-            self.finished = true;
-            return None;
-        }
-
-        // Check if this is the last element (front and back at same position)
-        let is_last = front_leaf == back_leaf && self.front_index == self.back_index;
-
-        // SAFETY: When the range is not finished and leaves are Some, self.tree is a valid pointer.
-        let tree = unsafe { &*self.tree };
-        let leaf = tree.node(back_leaf).as_leaf();
-        let key = leaf.key(self.back_index);
-        let value_handle = leaf.value(self.back_index);
-        let value = tree.value(value_handle);
-
-        // Move back position backward
-        if self.back_index == 0 {
-            self.back_leaf = leaf.prev();
-            if let Some(prev) = self.back_leaf {
-                let prev_leaf = tree.node(prev).as_leaf();
-                self.back_index = prev_leaf.key_count().saturating_sub(1);
-            }
-        } else {
-            self.back_index -= 1;
-        }
-
-        if is_last {
-            self.finished = true;
-        }
-
-        if self.remaining > 0 {
-            self.remaining -= 1;
-        }
-
-        Some((key, value))
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n)
     }
 }
 
@@ -2379,13 +2247,13 @@ impl<K, V> FusedIterator for Range<'_, K, V> {}
 
 impl<K, V> ExactSizeIterator for Range<'_, K, V> {
     fn len(&self) -> usize {
-        self.remaining
+        self.inner.len()
     }
 }
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Range<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Range").field("remaining", &self.remaining).finish()
+        f.debug_struct("Range").field("remaining", &self.inner.len()).finish()
     }
 }
 
@@ -2399,15 +2267,7 @@ impl<K, V> Default for Range<'_, K, V> {
     /// ```
     fn default() -> Self {
         Range {
-            // SAFETY: tree is never dereferenced when finished == true and leaves are None.
-            tree: core::ptr::NonNull::dangling().as_ptr(),
-            front_leaf: None,
-            front_index: 0,
-            back_leaf: None,
-            back_index: 0,
-            remaining: 0,
-            finished: true,
-            _marker: PhantomData,
+            inner: Iter::default(),
         }
     }
 }
@@ -2415,30 +2275,7 @@ impl<K, V> Default for Range<'_, K, V> {
 impl<K, V> Clone for Range<'_, K, V> {
     fn clone(&self) -> Self {
         Range {
-            tree: self.tree,
-            front_leaf: self.front_leaf,
-            front_index: self.front_index,
-            back_leaf: self.back_leaf,
-            back_index: self.back_index,
-            remaining: self.remaining,
-            finished: self.finished,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<K, V> RangeMut<'_, K, V> {
-    /// Creates a range iterator over the positions resolved by `cursor`.
-    fn from_cursor(tree: *mut RawOSBTreeMap<K, V>, cursor: RangeCursor) -> Self {
-        RangeMut {
-            tree,
-            front_leaf: cursor.front_leaf,
-            front_index: cursor.front_index,
-            back_leaf: cursor.back_leaf,
-            back_index: cursor.back_index,
-            remaining: cursor.len,
-            finished: cursor.len == 0,
-            _marker: PhantomData,
+            inner: self.inner.clone(),
         }
     }
 }
@@ -2447,106 +2284,27 @@ impl<'a, K, V> Iterator for RangeMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Check if we've already exhausted the range
-        if self.finished {
-            return None;
-        }
+        self.inner.next()
+    }
 
-        let front_leaf = self.front_leaf?;
-        let back_leaf = self.back_leaf?;
-
-        // Check if front has passed back (same leaf, front index > back index)
-        if front_leaf == back_leaf && self.front_index > self.back_index {
-            self.finished = true;
-            return None;
-        }
-
-        // Check if this is the last element (front and back at same position)
-        let is_last = front_leaf == back_leaf && self.front_index == self.back_index;
-
-        // SAFETY: We have exclusive access to the tree through the raw pointer.
-        // Keys and values are in separate arenas, accessed independently via raw pointers.
-        unsafe {
-            let leaf = RawOSBTreeMap::node_ptr(self.tree, front_leaf).as_leaf();
-            let key = leaf.key(self.front_index);
-            let value_handle = leaf.value(self.front_index);
-
-            let value = RawOSBTreeMap::value_mut_ptr(self.tree, value_handle);
-
-            // Advance front position
-            self.front_index += 1;
-            if self.front_index >= leaf.key_count() {
-                self.front_leaf = leaf.next();
-                self.front_index = 0;
-            }
-
-            if is_last {
-                self.finished = true;
-            }
-
-            if self.remaining > 0 {
-                self.remaining -= 1;
-            }
-
-            Some((key, value))
-        }
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // Exact count is known via order statistics
-        (self.remaining, Some(self.remaining))
+        self.inner.size_hint()
     }
+
+    o1_terminals!(sorted);
 }
 
 impl<K, V> DoubleEndedIterator for RangeMut<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        // Check if we've already exhausted the range
-        if self.finished {
-            return None;
-        }
+        self.inner.next_back()
+    }
 
-        let front_leaf = self.front_leaf?;
-        let back_leaf = self.back_leaf?;
-
-        // Check if back has passed front (same leaf, back index < front index)
-        if front_leaf == back_leaf && self.back_index < self.front_index {
-            self.finished = true;
-            return None;
-        }
-
-        // Check if this is the last element (front and back at same position)
-        let is_last = front_leaf == back_leaf && self.front_index == self.back_index;
-
-        // SAFETY: We have exclusive access to the tree through the raw pointer.
-        // Keys and values are in separate arenas, accessed independently via raw pointers.
-        unsafe {
-            let leaf = RawOSBTreeMap::node_ptr(self.tree, back_leaf).as_leaf();
-            let key = leaf.key(self.back_index);
-            let value_handle = leaf.value(self.back_index);
-
-            let value = RawOSBTreeMap::value_mut_ptr(self.tree, value_handle);
-
-            // Move back position backward
-            if self.back_index == 0 {
-                self.back_leaf = leaf.prev();
-                if let Some(prev) = self.back_leaf {
-                    let prev_leaf = RawOSBTreeMap::node_ptr(self.tree, prev).as_leaf();
-                    self.back_index = prev_leaf.key_count().saturating_sub(1);
-                }
-            } else {
-                self.back_index -= 1;
-            }
-
-            if is_last {
-                self.finished = true;
-            }
-
-            if self.remaining > 0 {
-                self.remaining -= 1;
-            }
-
-            Some((key, value))
-        }
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n)
     }
 }
 
@@ -2554,13 +2312,13 @@ impl<K, V> FusedIterator for RangeMut<'_, K, V> {}
 
 impl<K, V> ExactSizeIterator for RangeMut<'_, K, V> {
     fn len(&self) -> usize {
-        self.remaining
+        self.inner.len()
     }
 }
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for RangeMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RangeMut").field("remaining", &self.remaining).finish()
+        f.debug_struct("RangeMut").field("remaining", &self.inner.len()).finish()
     }
 }
 
@@ -2574,15 +2332,7 @@ impl<K, V> Default for RangeMut<'_, K, V> {
     /// ```
     fn default() -> Self {
         RangeMut {
-            // SAFETY: tree is never dereferenced when finished == true and leaves are None.
-            tree: core::ptr::NonNull::dangling().as_ptr(),
-            front_leaf: None,
-            front_index: 0,
-            back_leaf: None,
-            back_index: 0,
-            remaining: 0,
-            finished: true,
-            _marker: PhantomData,
+            inner: IterMut::default(),
         }
     }
 }
@@ -2625,7 +2375,6 @@ where
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use core::marker::PhantomData;
 
     #[test]
     fn internal_guards_handle_empty_first_and_last_leaves() {
@@ -2650,71 +2399,5 @@ mod tests {
 
         assert_eq!(map.range(..).next(), None);
         assert_eq!(map.range_mut(..).next(), None);
-    }
-
-    #[test]
-    fn range_iterators_handle_crossed_indices() {
-        let map = OSBTreeMap::from([(1, 10), (2, 20), (3, 30)]);
-        let leaf = map.raw.first_leaf().expect("non-empty map has a leaf");
-
-        {
-            let mut range = Range {
-                tree: &raw const map.raw,
-                front_leaf: Some(leaf),
-                front_index: 2,
-                back_leaf: Some(leaf),
-                back_index: 1,
-                remaining: 0,
-                finished: false,
-                _marker: PhantomData,
-            };
-            assert_eq!(range.next(), None);
-        }
-        {
-            let mut range = Range {
-                tree: &raw const map.raw,
-                front_leaf: Some(leaf),
-                front_index: 1,
-                back_leaf: Some(leaf),
-                back_index: 0,
-                remaining: 0,
-                finished: false,
-                _marker: PhantomData,
-            };
-            assert_eq!(range.next_back(), None);
-        }
-    }
-
-    #[test]
-    fn range_mut_iterators_handle_crossed_indices() {
-        let mut map = OSBTreeMap::from([(1, 10), (2, 20), (3, 30)]);
-        let leaf = map.raw.first_leaf().expect("non-empty map has a leaf");
-
-        {
-            let mut range_mut = RangeMut {
-                tree: &raw mut map.raw,
-                front_leaf: Some(leaf),
-                front_index: 2,
-                back_leaf: Some(leaf),
-                back_index: 1,
-                remaining: 0,
-                finished: false,
-                _marker: PhantomData,
-            };
-            assert_eq!(range_mut.next(), None);
-        }
-        {
-            let mut range_mut = RangeMut {
-                tree: &raw mut map.raw,
-                front_leaf: Some(leaf),
-                front_index: 1,
-                back_leaf: Some(leaf),
-                back_index: 0,
-                remaining: 0,
-                finished: false,
-                _marker: PhantomData,
-            };
-            assert_eq!(range_mut.next_back(), None);
-        }
     }
 }
