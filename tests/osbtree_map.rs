@@ -3290,19 +3290,25 @@ fn extend_still_keeps_first_key_and_last_value() {
 /// The `(key, tag, value)` triples of a map with `Tagged` keys.
 type TaggedTriples = Vec<(u8, usize, usize)>;
 
-/// Appends `b` to `a` in both an `OSBTreeMap` and a `BTreeMap` and returns the
-/// `(key, tag, value)` triples of each, which should match.
+/// Appends `b` to `a` and returns the `(key, tag, value)` triples of the result, along with
+/// what they should be: on equal keys, the key (and so the tag) from `a` and the value from `b`.
+///
+/// This is checked against a model rather than `BTreeMap`, whose behaviour changed: up to at
+/// least Rust 1.88 it took the whole entry from `other`; current releases keep `self`'s key.
 fn append_tagged(a: &[u8], b: &[u8]) -> (TaggedTriples, TaggedTriples) {
     // Tags in `b` start at 1000, so the side each surviving key came from is visible.
     let b_entries: Vec<_> = b.iter().enumerate().map(|(i, &k)| (tagged(k, 1_000 + i), 1_000 + i)).collect();
     let mut os: OSBTreeMap<Tagged, usize> = tagged_entries(a).into_iter().collect();
     let mut os_other: OSBTreeMap<Tagged, usize> = b_entries.iter().map(|&(k, v)| (tagged(k.key, k.tag), v)).collect();
-    let mut bt: BTreeMap<Tagged, usize> = tagged_entries(a).into_iter().collect();
-    let mut bt_other: BTreeMap<Tagged, usize> = b_entries.into_iter().collect();
     os.append(&mut os_other);
-    bt.append(&mut bt_other);
     assert!(os_other.is_empty());
-    (os.iter().map(|(k, &v)| (k.key, k.tag, v)).collect(), bt.iter().map(|(k, &v)| (k.key, k.tag, v)).collect())
+
+    let mut model: BTreeMap<u8, (usize, usize)> =
+        tagged_entries(a).into_iter().map(|(k, v)| (k.key, (k.tag, v))).collect();
+    for (k, v) in b_entries {
+        model.entry(k.key).and_modify(|entry| entry.1 = v).or_insert((k.tag, v));
+    }
+    (os.iter().map(|(k, &v)| (k.key, k.tag, v)).collect(), model.into_iter().map(|(k, (tag, v))| (k, tag, v)).collect())
 }
 
 #[test]

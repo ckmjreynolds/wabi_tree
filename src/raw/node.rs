@@ -88,6 +88,30 @@ impl<K> Node<K> {
         }
     }
 
+    /// Returns the leaf node by value, panicking if this is not a leaf.
+    pub(crate) fn into_leaf(self) -> LeafNode<K> {
+        match self {
+            Node::Leaf(leaf) => leaf,
+            Node::Internal(_) => panic!("expected leaf node"),
+        }
+    }
+
+    /// Returns the internal node by value, panicking if this is not internal.
+    pub(crate) fn into_internal(self) -> InternalNode<K> {
+        match self {
+            Node::Internal(internal) => internal,
+            Node::Leaf(_) => panic!("expected internal node"),
+        }
+    }
+
+    /// How full the node is: its keys if a leaf, its children if internal.
+    pub(crate) fn fill(&self) -> usize {
+        match self {
+            Node::Internal(internal) => internal.child_count(),
+            Node::Leaf(leaf) => leaf.key_count(),
+        }
+    }
+
     /// Returns the leaf node mutably, panicking if this is not a leaf.
     pub(crate) fn as_leaf_mut(&mut self) -> &mut LeafNode<K> {
         match self {
@@ -123,6 +147,7 @@ impl<K> Node<K> {
     /// Returns true if any of the node's buffers outgrew its inline capacity and moved to the
     /// heap. A node never holds more than one entry over its maximum, so this should not happen.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn spilled(&self) -> bool {
         match self {
             Node::Internal(n) => n.keys.spilled() || n.children.spilled() || n.child_sizes.spilled(),
@@ -424,11 +449,6 @@ impl<K> InternalNode<K> {
         self.child_sizes.extend(moved.child_sizes);
         self.update_size();
     }
-
-    /// Consumes the node and returns its children, dropping its separators.
-    pub(crate) fn into_children(self) -> SmallVec<[Handle; MAX_CHILDREN + 1]> {
-        self.children
-    }
 }
 
 /// Children moved between internal siblings, with the separators between them.
@@ -675,6 +695,20 @@ mod tests {
     fn as_internal_panics_on_leaf() {
         let leaf_node: Node<i32> = Node::new_leaf();
         let _ = leaf_node.as_internal();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected leaf node")]
+    fn into_leaf_panics_on_internal() {
+        let internal_node: Node<i32> = Node::new_internal();
+        let _ = internal_node.into_leaf();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected internal node")]
+    fn into_internal_panics_on_leaf() {
+        let leaf_node: Node<i32> = Node::new_leaf();
+        let _ = leaf_node.into_internal();
     }
 
     #[test]

@@ -1832,15 +1832,21 @@ fn from_array_keeps_last_duplicate() {
 
 #[test]
 fn append_equal_values_keep_the_one_in_self() {
-    for other_len in [3usize, 200] {
-        let mut os: OSBTreeSet<Tagged> = (0..=255).map(|k| tagged(k, 0)).collect();
-        let mut bt: BTreeSet<Tagged> = (0..=255).map(|k| tagged(k, 0)).collect();
-        let mut os_other: OSBTreeSet<Tagged> = (0..other_len as u8).map(|k| tagged(k, 1)).collect();
-        let mut bt_other: BTreeSet<Tagged> = (0..other_len as u8).map(|k| tagged(k, 1)).collect();
+    // Checked against a model, not `BTreeSet`, whose behaviour changed: up to at least Rust 1.88
+    // it kept the element from `other`; current releases keep the one in `self`.
+    let all: Vec<u8> = (0..=255).collect();
+    let evens: Vec<u8> = (0..=254).step_by(2).collect();
+    let few = vec![3u8, 4, 200];
+    // Few into many, many into few (inserted the other way round), and similar sizes (merged).
+    for (a, b) in [(&all, &few), (&few, &all), (&evens, &all), (&all, &evens), (&all, &all)] {
+        let mut os: OSBTreeSet<Tagged> = a.iter().map(|&k| tagged(k, 0)).collect();
+        let mut os_other: OSBTreeSet<Tagged> = b.iter().map(|&k| tagged(k, 1)).collect();
         os.append(&mut os_other);
-        bt.append(&mut bt_other);
-        let os_items: Vec<_> = os.iter().map(|t| (t.key, t.tag)).collect();
-        let bt_items: Vec<_> = bt.iter().map(|t| (t.key, t.tag)).collect();
-        assert_eq!(os_items, bt_items);
+        assert!(os_other.is_empty());
+        let items: Vec<_> = os.iter().map(|t| (t.key, t.tag)).collect();
+        let mut expected: Vec<_> = b.iter().filter(|k| !a.contains(k)).map(|&k| (k, 1)).collect();
+        expected.extend(a.iter().map(|&k| (k, 0)));
+        expected.sort_unstable();
+        assert_eq!(items, expected);
     }
 }

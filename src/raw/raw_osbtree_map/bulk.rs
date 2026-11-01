@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::ops::RangeBounds;
 
+use smallvec::SmallVec;
+
 use super::{Path, PathElement, RawOSBTreeMap, child_for_rank};
 use crate::raw::arena::Arena;
 use crate::raw::handle::Handle;
@@ -151,17 +153,16 @@ impl<K, V> RawOSBTreeMap<K, V> {
 
     /// Frees the subtree at `handle`, moving its entries to `out` in key order.
     fn drain_subtree(&mut self, handle: Handle, out: &mut Vec<(K, V)>) {
-        if let Node::Leaf(_) = self.nodes.get(handle) {
-            self.move_entries(handle, .., out);
-            self.nodes.free(handle);
-        } else {
-            let Node::Internal(internal) = self.nodes.take(handle) else {
-                unreachable!("not a leaf")
-            };
-            for child in internal.into_children() {
+        if let Node::Internal(internal) = self.nodes.get(handle) {
+            let children: SmallVec<[Handle; MAX_CHILDREN + 1]> =
+                (0..internal.child_count()).map(|i| internal.child(i)).collect();
+            for child in children {
                 self.drain_subtree(child, out);
             }
+        } else {
+            self.move_entries(handle, .., out);
         }
+        self.nodes.free(handle);
     }
 }
 
@@ -260,12 +261,9 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         tree
     }
 
-    /// Clones the separators a packed tree would need for the `len` entries starting at rank
+    /// Clones the separators a packed tree would need for the `len > 0` entries starting at rank
     /// `start` of this tree, walking the leaf chain from `start` once.
     fn clone_separators(&self, start: usize, len: usize) -> Vec<K> {
-        if len == 0 {
-            return Vec::new();
-        }
         let (mut leaf, mut index) = self.locate_rank(start).expect("`clone_separators()` - start in range");
         let mut offset = 0;
         separator_positions(len)
@@ -291,12 +289,10 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         self.nodes.get(self.root.expect("non-empty")).as_leaf()
     }
 
-    /// Returns the tree's height: 0 for a lone leaf.
+    /// Returns the height of this non-empty tree: 0 for a lone leaf.
     fn height(&self) -> usize {
         let mut height = 0;
-        let Some(mut node) = self.root else {
-            return 0;
-        };
+        let mut node = self.root.expect("`height()` - tree is non-empty");
         while let Node::Internal(internal) = self.nodes.get(node) {
             node = internal.child(0);
             height += 1;
@@ -333,16 +329,16 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
 
     /// Collapses internal roots with a single child.
     fn fix_top(&mut self) {
-        while let Some(root) = self.root {
-            match self.nodes.get(root) {
-                Node::Internal(internal) if internal.child_count() == 1 => {
-                    let child = internal.child(0);
-                    self.nodes.free(root);
-                    self.root = Some(child);
-                }
-                _ => break,
+        let mut root = self.root.expect("`fix_top()` - tree is non-empty");
+        while let Node::Internal(internal) = self.nodes.get(root) {
+            if internal.child_count() > 1 {
+                break;
             }
+            let child = internal.child(0);
+            self.nodes.free(root);
+            root = child;
         }
+        self.root = Some(root);
     }
 
     /// Restores the fill invariants along one edge of the tree, where nodes may be underfull
@@ -355,9 +351,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
     /// [`Self::clone_leaf_separator`].
     fn fix_border(&mut self, side: Side, mut leaf_separator: Option<K>) {
         self.fix_top();
-        let Some(mut node) = self.root else {
-            return;
-        };
+        let mut node = self.root.expect("`fix_border()` - tree is non-empty");
         while let Node::Internal(parent) = self.nodes.get(node) {
             let count = parent.child_count();
             debug_assert!(count >= 2, "`fix_border()` - border parent has a single child");
@@ -383,9 +377,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         if left_count + right_count <= MAX_CHILDREN {
             let (separator, right_handle, _) = self.nodes.get_mut(parent).as_internal_mut().remove_child(index);
             debug_assert_eq!(right_handle, right);
-            let Node::Internal(right_node) = self.nodes.take(right) else {
-                unreachable!("siblings are at the same height")
-            };
+            let right_node = self.nodes.take(right).into_internal();
             let left_node = self.nodes.get_mut(left).as_internal_mut();
             left_node.merge_with_right(separator, right_node);
             let merged_size = left_node.size();
@@ -425,9 +417,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 debug_assert!(separator.is_none(), "`fix_leaf_pair()` - merging needs no separator");
                 let (_, right_handle, _) = self.nodes.get_mut(parent).as_internal_mut().remove_child(index);
                 debug_assert_eq!(right_handle, right);
-                let Node::Leaf(right_leaf) = self.nodes.take(right) else {
-                    unreachable!("siblings are at the same height")
-                };
+                let right_leaf = self.nodes.take(right).into_leaf();
                 let left_leaf = self.nodes.get_mut(left).as_leaf_mut();
                 left_leaf.merge_with_right(right_leaf);
                 match left_leaf.next() {
@@ -490,7 +480,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
     /// returns them in key order, in O(elements removed + log n). Requires `0 < rank < len`, and
     /// `leaf_separator` from [`Self::clone_cut_separator`]. Clones nothing.
     fn cut(&mut self, rank: usize, side: Side, leaf_separator: Option<K>) -> Vec<(K, V)> {
-        debug_assert!(0 < rank && rank < self.len, "`cut()` - rank out of range");
+        debug_assert!((1..self.len).contains(&rank), "`cut()` - rank out of range");
         let root = self.root.expect("`cut()` - tree is non-empty");
         let moved_len = side.pick(rank, self.len - rank);
         let mut out = Vec::with_capacity(moved_len);
@@ -751,32 +741,24 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
     /// short. Neither way can a node outgrow its inline buffers.
     fn join_roots(&mut self, left: Handle, right: Handle, separator: K, leaf_separator: Option<K>) {
         self.root = Some(left);
-        let (fits, short) = match (self.nodes.get(left), self.nodes.get(right)) {
-            (Node::Leaf(l), Node::Leaf(r)) => {
-                let (l, r) = (l.key_count(), r.key_count());
-                (l + r <= MAX_KEYS, Side::short(l, MIN_LEAF_KEYS))
-            }
-            (Node::Internal(l), Node::Internal(r)) => {
-                let (l, r) = (l.child_count(), r.child_count());
-                (l + r <= MAX_CHILDREN, Side::short(l, MIN_CHILDREN + 1))
-            }
-            _ => unreachable!("trees of equal height"),
+        let leaves = matches!(self.nodes.get(left), Node::Leaf(_));
+        let (left_fill, right_fill) = (self.nodes.get(left).fill(), self.nodes.get(right).fill());
+        let (max, min) = if leaves {
+            (MAX_KEYS, MIN_LEAF_KEYS)
+        } else {
+            (MAX_CHILDREN, MIN_CHILDREN + 1)
         };
 
-        if fits {
+        if left_fill + right_fill <= max {
             debug_assert!(leaf_separator.is_none(), "`join_roots()` - merging needs no separator");
             let right_node = self.nodes.take(right);
-            match (self.nodes.get_mut(left), right_node) {
-                (Node::Leaf(left_leaf), Node::Leaf(right_leaf)) => {
-                    drop(separator);
-                    // The two leaves were the whole chain; the merged one ends it.
-                    left_leaf.merge_with_right(right_leaf);
-                    self.last_leaf = Some(left);
-                }
-                (Node::Internal(left_node), Node::Internal(right_node)) => {
-                    left_node.merge_with_right(separator, right_node);
-                }
-                _ => unreachable!("trees of equal height"),
+            if leaves {
+                drop(separator);
+                // The two leaves were the whole chain; the merged one ends it.
+                self.nodes.get_mut(left).as_leaf_mut().merge_with_right(right_node.into_leaf());
+                self.last_leaf = Some(left);
+            } else {
+                self.nodes.get_mut(left).as_internal_mut().merge_with_right(separator, right_node.into_internal());
             }
             return;
         }
@@ -785,7 +767,8 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         // With an empty path, this puts a new root over `left` and `right`.
         self.propagate_split(&mut Path::new(), separator, right, left_size, right_size);
         let new_root = self.root.expect("just made");
-        if matches!(self.nodes.get(left), Node::Leaf(_)) {
+        let short = Side::short(left_fill, min);
+        if leaves {
             self.fix_leaf_pair(new_root, 0, short, leaf_separator);
         } else {
             debug_assert!(leaf_separator.is_none());
@@ -922,6 +905,13 @@ mod tests {
                 split_and_check(&keys, Build::Scrambled(u64::from(n) * 31 + rank as u64), rank);
             }
         }
+    }
+
+    #[test]
+    fn split_off_of_an_empty_tree_is_empty() {
+        let mut tree: RawOSBTreeMap<u32, u32> = RawOSBTreeMap::new();
+        let right = tree.split_off(&5);
+        assert!(tree.is_empty() && right.is_empty());
     }
 
     #[test]
