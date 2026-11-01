@@ -100,9 +100,19 @@
             fail_ci_if_error: true
 
     # Undefined-behavior checks of the unsafe code paths (pinned nightly for reproducibility)
+    # The two aliasing models run as parallel jobs, and nextest runs each test in its own
+    # process so they spread across the runner's cores (Miri itself is single-threaded).
     miri:
-      name: Miri
+      name: Miri (${{ matrix.model.name }})
       runs-on: ubuntu-latest
+      strategy:
+        fail-fast: false
+        matrix:
+          model:
+            - name: Stacked Borrows
+              flags: ""
+            - name: Tree Borrows
+              flags: -Zmiri-tree-borrows
       steps:
         - uses: actions/checkout@v7
         - uses: dtolnay/rust-toolchain@master
@@ -110,13 +120,12 @@
             toolchain: nightly-2026-10-17
             components: miri, rust-src
         - uses: Swatinem/rust-cache@v2
+        - uses: taiki-e/install-action@nextest
         - run: cargo +nightly-2026-10-17 miri setup
-        - name: Miri (Stacked Borrows)
-          run: cargo +nightly-2026-10-17 miri test --test miri
-        - name: Miri (Tree Borrows)
-          run: cargo +nightly-2026-10-17 miri test --test miri
+        - name: Miri
+          run: cargo +nightly-2026-10-17 miri nextest run --test miri
           env:
-            MIRIFLAGS: -Zmiri-tree-borrows
+            MIRIFLAGS: ${{ matrix.model.flags }}
 
     # Security audit
     audit:
