@@ -1506,6 +1506,10 @@ impl<'a, T> Iterator for Iter<'a, T> {
         self.inner.next()
     }
 
+    fn nth(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth(n)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
@@ -1518,6 +1522,10 @@ impl<'a, T> Iterator for Iter<'a, T> {
 impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
     fn next_back(&mut self) -> Option<&'a T> {
         self.inner.next_back()
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth_back(n)
     }
 }
 
@@ -1565,6 +1573,10 @@ impl<T: Clone + Ord> Iterator for IntoIter<T> {
         self.inner.next()
     }
 
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
@@ -1573,6 +1585,10 @@ impl<T: Clone + Ord> Iterator for IntoIter<T> {
 impl<T: Clone + Ord> DoubleEndedIterator for IntoIter<T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back()
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth_back(n)
     }
 }
 
@@ -1612,6 +1628,10 @@ impl<'a, T> Iterator for Range<'a, T> {
         self.inner.next().map(|(k, ())| k)
     }
 
+    fn nth(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth(n).map(|(k, ())| k)
+    }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
@@ -1620,6 +1640,10 @@ impl<'a, T> Iterator for Range<'a, T> {
 impl<'a, T> DoubleEndedIterator for Range<'a, T> {
     fn next_back(&mut self) -> Option<&'a T> {
         self.inner.next_back().map(|(k, ())| k)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<&'a T> {
+        self.inner.nth_back(n).map(|(k, ())| k)
     }
 }
 

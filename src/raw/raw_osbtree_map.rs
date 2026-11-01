@@ -5,8 +5,13 @@ use smallvec::SmallVec;
 
 use super::arena::Arena;
 use super::handle::Handle;
-use super::node::{InternalNode, LeafNode, MAX_KEYS, Node, SearchResult};
+use super::node::{InternalNode, LeafNode, MAX_KEYS, MIN_LEAF_KEYS, Node, SearchResult};
 use super::size::Size;
+
+/// How many sibling leaves [`RawOSBTreeMap::seek`] walks before it climbs the finger instead.
+/// Every leaf except a root leaf holds at least `MIN_LEAF_KEYS` keys, so a target within
+/// `HOP_LEAVES * MIN_LEAF_KEYS` positions of the current leaf is at most this many hops away.
+const HOP_LEAVES: usize = 2;
 
 /// The core B+Tree implementation backing `OSBTreeMap`.
 pub(crate) struct RawOSBTreeMap<K, V> {
@@ -33,6 +38,191 @@ pub(crate) struct RangeCursor {
     pub(crate) back_leaf: Option<Handle>,
     pub(crate) back_index: usize,
     pub(crate) len: usize,
+    /// Rank of the first element of the range.
+    pub(crate) start_rank: usize,
+}
+
+/// One level of a [`Finger`]: a node and the ranks `start..end` held in its subtree.
+#[derive(Clone, Copy)]
+struct FingerLevel {
+    node: Handle,
+    start: usize,
+    end: usize,
+}
+
+/// The path from the root to the node an iterator last jumped to, with each level's rank range.
+/// [`RawOSBTreeMap::seek`] climbs it only as far as a jump needs instead of restarting at the
+/// root. A [`Span`] allocates its fingers on its first long jump, so plain iteration never pays
+/// for them. Inner nodes have at least `MIN_CHILDREN` (64) children, so eight levels cover any
+/// tree that fits in memory and the levels live inside that one allocation.
+type Finger = SmallVec<[FingerLevel; 8]>;
+
+/// The two fingers of a [`Span`], one per end. Boxed so that a span that never makes a long
+/// jump pays only for a null pointer.
+#[derive(Default)]
+struct Fingers {
+    front: Finger,
+    back: Finger,
+}
+
+/// The state shared by the borrowing iterators (`Iter`, `IterMut`, and the `Range` types that
+/// wrap them): the positions of the front and back elements, how many elements are left, and
+/// the rank bookkeeping that lets `nth` and `nth_back` jump by rank.
+///
+/// `remaining` is the only test for exhaustion: the positions are meaningful only while it is
+/// non-zero, so the iterators never compare positions to find the end.
+pub(crate) struct Span {
+    front_leaf: Option<Handle>,
+    front_index: usize,
+    back_leaf: Option<Handle>,
+    back_index: usize,
+    remaining: usize,
+    /// Rank of the front element. The back element's rank is `front_rank + remaining - 1`, so
+    /// it needs no field of its own.
+    front_rank: usize,
+    /// Allocated on the first long jump; see [`RawOSBTreeMap::seek`].
+    fingers: Option<alloc::boxed::Box<Fingers>>,
+}
+
+impl Default for Span {
+    /// An empty span. It never dereferences its tree pointer.
+    fn default() -> Self {
+        Self::new(RangeCursor::default())
+    }
+}
+
+/// The fingers are only a cache that [`RawOSBTreeMap::seek`] rebuilds on demand, so a clone
+/// starts without them rather than allocating copies.
+impl Clone for Span {
+    fn clone(&self) -> Self {
+        Span {
+            fingers: None,
+            ..*self
+        }
+    }
+}
+
+impl Span {
+    /// Creates a span over the elements `cursor` resolved.
+    pub(crate) fn new(cursor: RangeCursor) -> Self {
+        Span {
+            front_leaf: cursor.front_leaf,
+            front_index: cursor.front_index,
+            back_leaf: cursor.back_leaf,
+            back_index: cursor.back_index,
+            remaining: cursor.len,
+            front_rank: cursor.start_rank,
+            fingers: None,
+        }
+    }
+
+    /// Returns the number of elements left.
+    pub(crate) const fn len(&self) -> usize {
+        self.remaining
+    }
+
+    /// Returns the position of the front element and moves the front past it, or returns
+    /// `None` if no element is left.
+    ///
+    /// # Safety
+    /// If elements remain, `tree` must be valid and unmodified since the span was created.
+    pub(crate) unsafe fn pop_front<K, V>(&mut self, tree: *const RawOSBTreeMap<K, V>) -> Option<(Handle, usize)> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let pos = (self.front_leaf.expect("Span::pop_front: elements remain but the front is empty"), self.front_index);
+        // SAFETY: elements remain, so the caller guarantees `tree` is valid.
+        let leaf = unsafe { RawOSBTreeMap::node_ptr(tree, pos.0) }.as_leaf();
+        self.remaining -= 1;
+        self.front_rank += 1;
+        self.front_index += 1;
+        if self.front_index >= leaf.key_count() {
+            self.front_leaf = leaf.next();
+            self.front_index = 0;
+        }
+        Some(pos)
+    }
+
+    /// Returns the position of the back element and moves the back before it, or returns
+    /// `None` if no element is left.
+    ///
+    /// # Safety
+    /// As for [`Self::pop_front`].
+    pub(crate) unsafe fn pop_back<K, V>(&mut self, tree: *const RawOSBTreeMap<K, V>) -> Option<(Handle, usize)> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let pos = (self.back_leaf.expect("Span::pop_back: elements remain but the back is empty"), self.back_index);
+        self.remaining -= 1;
+        if self.back_index == 0 {
+            // SAFETY: elements remained, so the caller guarantees `tree` is valid.
+            self.back_leaf = unsafe { RawOSBTreeMap::node_ptr(tree, pos.0) }.as_leaf().prev();
+            if let Some(prev) = self.back_leaf {
+                // SAFETY: as above.
+                let count = unsafe { RawOSBTreeMap::node_ptr(tree, prev) }.as_leaf().key_count();
+                self.back_index = count.saturating_sub(1);
+            }
+        } else {
+            self.back_index -= 1;
+        }
+        Some(pos)
+    }
+
+    /// Skips `n` elements at the front, then pops the front as [`Self::pop_front`] does.
+    /// Returns `None`, leaving the span empty, if fewer than `n + 1` elements are left.
+    ///
+    /// # Safety
+    /// As for [`Self::pop_front`].
+    pub(crate) unsafe fn nth_front<K, V>(
+        &mut self,
+        tree: *const RawOSBTreeMap<K, V>,
+        n: usize,
+    ) -> Option<(Handle, usize)> {
+        if n >= self.remaining {
+            self.remaining = 0;
+            return None;
+        }
+        if n > 0 {
+            let current = self.front_leaf.expect("Span::nth_front: elements remain but the front is empty");
+            let target = self.front_rank + n;
+            let (index, rank, fingers) = (self.front_index, self.front_rank, &mut self.fingers);
+            // SAFETY: n < remaining, so the caller guarantees `tree` is valid.
+            let (leaf, index) =
+                unsafe { RawOSBTreeMap::seek(tree, current, index, rank, target, fingers, |f| &mut f.front) };
+            (self.front_leaf, self.front_index, self.front_rank) = (Some(leaf), index, target);
+            self.remaining -= n;
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { self.pop_front(tree) }
+    }
+
+    /// Skips `n` elements at the back, then pops the back, as [`Self::nth_front`] does at the
+    /// front.
+    ///
+    /// # Safety
+    /// As for [`Self::pop_front`].
+    pub(crate) unsafe fn nth_back<K, V>(
+        &mut self,
+        tree: *const RawOSBTreeMap<K, V>,
+        n: usize,
+    ) -> Option<(Handle, usize)> {
+        if n >= self.remaining {
+            self.remaining = 0;
+            return None;
+        }
+        if n > 0 {
+            let current = self.back_leaf.expect("Span::nth_back: elements remain but the back is empty");
+            let rank = self.front_rank + self.remaining - 1;
+            let (index, fingers) = (self.back_index, &mut self.fingers);
+            // SAFETY: n < remaining, so the caller guarantees `tree` is valid.
+            let (leaf, index) =
+                unsafe { RawOSBTreeMap::seek(tree, current, index, rank, rank - n, fingers, |f| &mut f.back) };
+            (self.back_leaf, self.back_index) = (Some(leaf), index);
+            self.remaining -= n;
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { self.pop_back(tree) }
+    }
 }
 
 /// Path element for tracking traversal during mutations.
@@ -127,6 +317,7 @@ impl<K, V> RawOSBTreeMap<K, V> {
     }
 
     /// Returns a reference to the first leaf, if any.
+    #[cfg(test)]
     pub(crate) fn first_leaf(&self) -> Option<Handle> {
         self.first_leaf
     }
@@ -148,6 +339,19 @@ impl<K, V> RawOSBTreeMap<K, V> {
         let last_leaf = self.last_leaf?;
         let count = self.nodes.get(last_leaf).as_leaf().key_count();
         count.checked_sub(1).map(|idx| (last_leaf, idx))
+    }
+
+    /// Returns a cursor over every element: the first leaf from index 0 through the last position.
+    pub(crate) fn full_cursor(&self) -> RangeCursor {
+        let (back_leaf, back_index) = self.last_position().unzip();
+        RangeCursor {
+            front_leaf: self.first_leaf,
+            front_index: 0,
+            back_leaf,
+            back_index: back_index.unwrap_or(0),
+            len: self.len,
+            start_rank: 0,
+        }
     }
 
     /// Returns a reference to the root node, if any.
@@ -197,6 +401,106 @@ impl<K, V> RawOSBTreeMap<K, V> {
         // SAFETY: We only access the `values` field, avoiding aliasing with the `nodes` field,
         // and `get_mut_ptr` borrows only the one slot, so values handed out earlier stay valid.
         unsafe { Arena::get_mut_ptr(core::ptr::addr_of_mut!((*ptr).values), handle) }
+    }
+
+    /// Returns the position of the element with rank `target`, starting from the position
+    /// `(leaf, index)`, whose rank is `rank`. Used by the iterators' `nth` and `nth_back`.
+    ///
+    /// A target in the current leaf, or within `HOP_LEAVES` leaves of it, is reached through the
+    /// leaf chain. For a longer jump, `finger` is climbed to the lowest node whose rank range
+    /// contains `target` (no node reads), and the search descends from there, leaving `finger`
+    /// on the new path. A long jump reads O(1 + log d) nodes, where `d` is the distance from the
+    /// previous long jump's target (the steps in between were each paid for by `next` or a
+    /// short jump), so a whole pass over an iterator stays O(n) however it is split into jumps.
+    ///
+    /// # Safety
+    /// - `ptr` must point to a valid, allocated `RawOSBTreeMap<K, V>`.
+    /// - `(leaf, index)` must be a valid position in it, with rank `rank`.
+    /// - `target` must be less than the tree's length, and the finger that `which` picks from
+    ///   `fingers` must be empty or have been built by earlier calls on the same, unmodified tree.
+    ///
+    /// `fingers` is allocated only on a long jump, so a span that makes only short jumps never
+    /// pays for it.
+    unsafe fn seek(
+        ptr: *const Self,
+        mut leaf: Handle,
+        index: usize,
+        rank: usize,
+        target: usize,
+        fingers: &mut Option<alloc::boxed::Box<Fingers>>,
+        which: fn(&mut Fingers) -> &mut Finger,
+    ) -> (Handle, usize) {
+        // SAFETY (all `node_ptr` calls and field reads below): the caller guarantees `ptr` is valid.
+        let leaf_at = |handle| unsafe { Self::node_ptr(ptr, handle) }.as_leaf();
+
+        // Short jump: walk the leaf chain, giving up once the target is too far for the hops left.
+        if target >= rank {
+            let mut start = rank - index; // rank of the first key in `leaf`
+            for hops in 0..=HOP_LEAVES {
+                let node = leaf_at(leaf);
+                let end = start + node.key_count();
+                if target < end {
+                    return (leaf, target - start);
+                }
+                if target - end >= (HOP_LEAVES - hops) * MIN_LEAF_KEYS {
+                    break;
+                }
+                let Some(next) = node.next() else {
+                    break;
+                };
+                (leaf, start) = (next, end);
+            }
+        } else {
+            let mut start = rank - index; // rank of the first key in `leaf`
+            for hops in 0..=HOP_LEAVES {
+                if target >= start {
+                    return (leaf, target - start);
+                }
+                // `start - target - 1` keys lie between `target` and `leaf`, mirroring `target - end` above.
+                if start - target > (HOP_LEAVES - hops) * MIN_LEAF_KEYS {
+                    break;
+                }
+                let Some(prev) = leaf_at(leaf).prev() else {
+                    break;
+                };
+                (leaf, start) = (prev, start - leaf_at(prev).key_count());
+            }
+        }
+
+        // Long jump: climb the finger to the lowest node containing `target`, then descend.
+        let finger = which(fingers.get_or_insert_default());
+        while finger.last().is_some_and(|level| !(level.start..level.end).contains(&target)) {
+            finger.pop();
+        }
+        let mut level = if let Some(&level) = finger.last() {
+            level
+        } else {
+            let root = unsafe { core::ptr::addr_of!((*ptr).root).read() };
+            let len = unsafe { core::ptr::addr_of!((*ptr).len).read() };
+            let level = FingerLevel {
+                node: root.expect("seek: tree is empty"),
+                start: 0,
+                end: len,
+            };
+            finger.push(level);
+            level
+        };
+        loop {
+            match unsafe { Self::node_ptr(ptr, level.node) } {
+                Node::Leaf(_) => return (level.node, target - level.start),
+                Node::Internal(internal) => {
+                    let (child, before) =
+                        child_for_rank(internal, target - level.start).expect("seek: tree size invariant violated");
+                    let start = level.start + before;
+                    level = FingerLevel {
+                        node: internal.child(child),
+                        start,
+                        end: start + internal.child_size(child).to_usize(),
+                    };
+                    finger.push(level);
+                }
+            }
+        }
     }
 
     /// Takes a value from the arena.
@@ -949,24 +1253,16 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         let mut remaining = rank;
 
         while let Node::Internal(internal) = self.nodes.get(current) {
-            // Find which child contains the rank
-            let mut found = false;
-            for i in 0..internal.child_count() {
-                let child_size = internal.child_size(i).to_usize();
-                if remaining < child_size {
-                    current = internal.child(i);
-                    found = true;
-                    break;
-                }
-                remaining -= child_size;
-            }
-            // A real assert: in release builds a violated invariant would otherwise loop forever.
-            assert!(
-                found,
-                "locate_rank: tree size invariant violated - rank {} not found in children (node size: {})",
-                rank,
-                internal.size().to_usize()
-            );
+            // A real panic: in release builds a violated invariant would otherwise loop forever.
+            let Some((child, before)) = child_for_rank(internal, remaining) else {
+                panic!(
+                    "locate_rank: tree size invariant violated - rank {} not found in children (node size: {})",
+                    rank,
+                    internal.size().to_usize()
+                );
+            };
+            current = internal.child(child);
+            remaining -= before;
         }
 
         Some((current, remaining))
@@ -1085,10 +1381,26 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 back_leaf: Some(back_leaf),
                 back_index,
                 len: end_rank - start_rank,
+                start_rank,
             },
             _ => RangeCursor::default(),
         }
     }
+}
+
+/// Returns the index of the child of `internal` holding the element `rank` positions into its
+/// subtree, and the number of elements in the children before it. Returns `None` if `rank` is
+/// not less than the sum of the child sizes.
+fn child_for_rank<K>(internal: &InternalNode<K>, rank: usize) -> Option<(usize, usize)> {
+    let mut before = 0;
+    for i in 0..internal.child_count() {
+        let child_size = internal.child_size(i).to_usize();
+        if rank - before < child_size {
+            return Some((i, before));
+        }
+        before += child_size;
+    }
+    None
 }
 
 #[cfg(test)]

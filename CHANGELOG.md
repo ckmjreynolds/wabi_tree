@@ -6,6 +6,11 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+### Performance
+- `nth` and `nth_back` on the map and set iterators (including ranges) jump by rank instead of
+  stepping one element at a time, so `iter().skip(n)`, `rev().skip(n)` and `step_by` cost
+  O(log n) per jump rather than O(n) (#18).
+
 ## [0.1.3] - 2026-10-18
 
 ### Fixed

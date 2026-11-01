@@ -2849,3 +2849,119 @@ fn panicking_key_clone_during_inserts_and_removes_keeps_tree_consistent() {
     }
     assert!(model.is_empty());
 }
+
+// ─── Rank jumps: nth / nth_back ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Next,
+    NextBack,
+    Nth(usize),
+    NthBack(usize),
+}
+
+/// Jump sizes biased toward the boundaries of `nth`'s strategies: within a leaf, one or two
+/// sibling leaves away (leaves hold 64..=127 keys), and long jumps through the tree.
+fn step_strategy() -> impl Strategy<Value = Step> {
+    let skip = prop_oneof![0usize..4, 50usize..300, 300usize..5_000, 5_000usize..60_000];
+    prop_oneof![
+        1 => Just(Step::Next),
+        1 => Just(Step::NextBack),
+        2 => skip.clone().prop_map(Step::Nth),
+        2 => skip.prop_map(Step::NthBack),
+    ]
+}
+
+/// A map of up to 60,000 entries (up to three levels deep) with random keys removed, so leaves
+/// are unevenly filled. Each value is twice its key.
+fn jump_map_strategy() -> impl Strategy<Value = OSBTreeMap<i64, i64>> {
+    (1i64..60_000).prop_flat_map(|n| (Just(n), proptest::collection::vec(0..n, 0..n as usize / 2))).prop_map(
+        |(n, removals)| {
+            let mut map: OSBTreeMap<i64, i64> = (0..n).map(|k| (k, k * 2)).collect();
+            for k in removals {
+                map.remove(&k);
+            }
+            map
+        },
+    )
+}
+
+/// Applies `steps` to `actual` and to a slice iterator over `expected`, asserting the same keys
+/// and lengths after every step, then drains both from the front.
+fn assert_steps_match<I: DoubleEndedIterator + ExactSizeIterator>(
+    mut actual: I,
+    key: impl Fn(I::Item) -> i64,
+    expected: &[i64],
+    steps: &[Step],
+) -> Result<(), TestCaseError> {
+    let mut expected = expected.iter().copied();
+    for &step in steps {
+        let (a, e) = match step {
+            Step::Next => (actual.next(), expected.next()),
+            Step::NextBack => (actual.next_back(), expected.next_back()),
+            Step::Nth(n) => (actual.nth(n), expected.nth(n)),
+            Step::NthBack(n) => (actual.nth_back(n), expected.nth_back(n)),
+        };
+        prop_assert_eq!(a.map(&key), e, "after {:?}", step);
+        prop_assert_eq!(actual.len(), expected.len(), "len after {:?}", step);
+    }
+    let rest: Vec<i64> = actual.by_ref().map(&key).collect();
+    prop_assert_eq!(rest, expected.collect::<Vec<_>>());
+    prop_assert!(actual.next().is_none() && actual.next_back().is_none());
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// `nth`/`nth_back` on `iter`, `keys`, `values` and `into_iter` match a slice iterator.
+    #[test]
+    fn iter_nth_matches_slice(map in jump_map_strategy(), steps in proptest::collection::vec(step_strategy(), 1..100)) {
+        let keys: Vec<i64> = map.keys().copied().collect();
+        assert_steps_match(map.iter(), |(k, v)| { assert_eq!(*v, k * 2); *k }, &keys, &steps)?;
+        assert_steps_match(map.keys(), |k| *k, &keys, &steps)?;
+        assert_steps_match(map.values(), |v| v / 2, &keys, &steps)?;
+        assert_steps_match(map.clone().into_iter(), |(k, _)| k, &keys, &steps)?;
+        assert_steps_match(map.clone().into_keys(), |k| k, &keys, &steps)?;
+        assert_steps_match(map.into_values(), |v| v / 2, &keys, &steps)?;
+    }
+
+    /// `nth`/`nth_back` on `iter_mut` and `values_mut` match a slice iterator.
+    #[test]
+    fn iter_mut_nth_matches_slice(mut map in jump_map_strategy(), steps in proptest::collection::vec(step_strategy(), 1..100)) {
+        let keys: Vec<i64> = map.keys().copied().collect();
+        assert_steps_match(map.iter_mut(), |(k, v)| { assert_eq!(*v, k * 2); *k }, &keys, &steps)?;
+        assert_steps_match(map.values_mut(), |v| *v / 2, &keys, &steps)?;
+    }
+
+    /// `nth`/`nth_back` on `range` and `range_mut` match a slice iterator over the same range.
+    #[test]
+    fn range_nth_matches_slice(
+        mut map in jump_map_strategy(),
+        lo in -100i64..60_000,
+        len in 0i64..60_000,
+        steps in proptest::collection::vec(step_strategy(), 1..100),
+    ) {
+        let hi = lo + len;
+        let keys: Vec<i64> = map.keys().copied().filter(|k| (lo..hi).contains(k)).collect();
+        assert_steps_match(map.range(lo..hi), |(k, _)| *k, &keys, &steps)?;
+        assert_steps_match(map.range_mut(lo..hi), |(k, _)| *k, &keys, &steps)?;
+    }
+}
+
+#[test]
+fn nth_on_empty_and_exhausted_iterators() {
+    let mut map: OSBTreeMap<i64, i64> = OSBTreeMap::new();
+    assert_eq!(map.iter().nth(2), None);
+    assert_eq!(map.iter_mut().nth_back(0), None);
+    assert_eq!(map.range(..).nth(3), None);
+    assert_eq!(map.range_mut(..).nth_back(3), None);
+
+    map.extend((0..1_000).map(|k| (k, k)));
+    let mut range = map.range(10..20);
+    assert_eq!(range.nth(10), None);
+    assert_eq!(range.next_back(), None);
+    let mut iter = map.iter();
+    assert_eq!(iter.nth_back(999), Some((&0, &0)));
+    assert_eq!(iter.next(), None);
+}

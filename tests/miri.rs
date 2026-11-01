@@ -161,3 +161,32 @@ fn set_iterators() {
     assert_eq!(a.symmetric_difference(&b).count(), (0..N).filter(|x| (x % 2 == 0) != (x % 3 == 0)).count());
     assert_eq!(a.into_iter().next_back(), Some(N - 2));
 }
+
+/// Jumps of every size (within a leaf, to a sibling leaf, and through the tree) while holding
+/// every entry already returned, then writes through all of them.
+fn jump_hold_and_write<'a, I: DoubleEndedIterator<Item = (&'a u32, &'a mut u32)>>(mut iter: I) -> Vec<u32> {
+    let mut held = Vec::new();
+    for n in [0, 5, 100, 300] {
+        held.extend(iter.nth(n));
+        held.extend(iter.nth_back(n));
+    }
+    held.extend(iter);
+    held.into_iter()
+        .map(|(k, v)| {
+            *v += 1;
+            *k
+        })
+        .collect()
+}
+
+#[test]
+fn nth_on_mutable_iterators_keeps_references_valid() {
+    let mut map = map();
+    let written = jump_hold_and_write(map.iter_mut());
+    assert!(map.iter().all(|(k, v)| *v == k + u32::from(written.contains(k))));
+
+    let mut map = self::map();
+    let written = jump_hold_and_write(map.range_mut(10..990));
+    assert!(written.iter().all(|k| (10..990).contains(k)));
+    assert!(map.iter().all(|(k, v)| *v == k + u32::from(written.contains(k))));
+}

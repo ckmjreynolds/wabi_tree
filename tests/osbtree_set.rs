@@ -1539,3 +1539,24 @@ fn set_operations_algorithm_paths_and_traits() {
     let extractor = extract_set.extract_if(.., |_| false);
     let _ = format!("{:?}", extractor);
 }
+
+// ─── Rank jumps: nth / nth_back ─────────────────────────────────────────────
+
+/// `step_by` drives `nth` (and `nth_back` when reversed) on the set iterators.
+#[test]
+fn set_iterators_step_by_match_vec() {
+    let set: OSBTreeSet<i64> = (0..50_000).filter(|k| k % 7 != 3).collect();
+    let all: Vec<i64> = set.iter().copied().collect();
+    let in_range: Vec<i64> = all.iter().copied().filter(|k| (1_000..40_000).contains(k)).collect();
+    for step in [1, 2, 63, 64, 65, 127, 128, 129, 1_000, 30_000] {
+        let expected: Vec<i64> = all.iter().copied().step_by(step).collect();
+        assert_eq!(set.iter().step_by(step).copied().collect::<Vec<_>>(), expected, "step {step}");
+        assert_eq!(set.clone().into_iter().step_by(step).collect::<Vec<_>>(), expected, "step {step}");
+        let expected_back: Vec<i64> = all.iter().copied().rev().step_by(step).collect();
+        assert_eq!(set.iter().rev().step_by(step).copied().collect::<Vec<_>>(), expected_back, "step {step}");
+        let expected_range: Vec<i64> = in_range.iter().copied().step_by(step).collect();
+        assert_eq!(set.range(1_000..40_000).step_by(step).copied().collect::<Vec<_>>(), expected_range);
+        let expected_range_back: Vec<i64> = in_range.iter().copied().rev().step_by(step).collect();
+        assert_eq!(set.range(1_000..40_000).rev().step_by(step).copied().collect::<Vec<_>>(), expected_range_back);
+    }
+}
