@@ -638,7 +638,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         let mut rank = 0;
         let leaf = self.descend(self.root?, |_, internal| {
             let child_idx = internal.search_child(key);
-            rank += internal.child_sizes()[..child_idx].iter().map(|s| s.to_usize()).sum::<usize>();
+            rank += size_before(internal, child_idx);
             child_idx
         });
         Some((leaf, self.nodes.get(leaf).as_leaf(), rank))
@@ -661,6 +661,12 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             });
             child_index
         })
+    }
+
+    /// Returns the number of elements in leaves to the left of the leaf a descent along `path`
+    /// reached.
+    fn rank_along_path(&self, path: &Path) -> usize {
+        path.iter().map(|elem| size_before(self.nodes.get(elem.node).as_internal(), elem.child_index)).sum()
     }
 
     /// Searches for a key and returns the leaf handle and index if found.
@@ -775,6 +781,33 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
     pub(crate) fn insert_with_position(&mut self, key: K, value: V) -> ((Handle, usize), Option<V>) {
         let (_, position, old_value) = self.insert_impl(key, value, false);
         (position, old_value)
+    }
+
+    /// Inserts a key-value pair into the tree, returning the rank the key now has and the old
+    /// value if the key was already present.
+    ///
+    /// This mirrors [`Self::insert_impl`] rather than sharing it, so plain inserts don't pay for
+    /// the rank.
+    pub(crate) fn insert_with_rank(&mut self, key: K, value: V) -> (usize, Option<V>) {
+        let Some(root) = self.root else {
+            return (0, self.insert(key, value));
+        };
+        let mut path = Path::new();
+        let leaf_handle = self.descend_with_path(root, &mut path, |internal| internal.search_child(&key));
+        match self.nodes.get(leaf_handle).as_leaf().search(&key) {
+            SearchResult::Found(idx) => {
+                let rank = self.rank_along_path(&path) + idx;
+                let value_handle = self.nodes.get(leaf_handle).as_leaf().value(idx);
+                (rank, Some(core::mem::replace(self.values.get_mut(value_handle), value)))
+            }
+            SearchResult::NotFound(idx) => {
+                // Taken before `insert_at`, whose split pops `path`. A split moves the key to
+                // another leaf but not to another rank.
+                let rank = self.rank_along_path(&path) + idx;
+                self.insert_at(leaf_handle, idx, key, value, &mut path);
+                (rank, None)
+            }
+        }
     }
 
     /// Inserts a key-value pair, but if an equal key is present, replaces only the key and keeps
@@ -1013,6 +1046,34 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         let SearchResult::Found(idx) = self.nodes.get(leaf_handle).as_leaf().search(key) else {
             return None;
         };
+        Some(self.remove_at(leaf_handle, idx, &mut path))
+    }
+
+    /// Removes a key from the tree and returns its rank before removal and the key-value pair.
+    pub(crate) fn remove_entry_with_rank<Q>(&mut self, key: &Q) -> Option<(usize, K, V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        let root = self.root?;
+        let mut path = Path::new();
+        let leaf_handle = self.descend_with_path(root, &mut path, |internal| internal.search_child(key));
+        let SearchResult::Found(idx) = self.nodes.get(leaf_handle).as_leaf().search(key) else {
+            return None;
+        };
+        let rank = self.rank_along_path(&path) + idx;
+        let (k, v) = self.remove_at(leaf_handle, idx, &mut path);
+        Some((rank, k, v))
+    }
+
+    /// Removes and returns the key-value pair at `rank`, or `None` if `rank` is out of bounds.
+    pub(crate) fn remove_by_rank(&mut self, rank: usize) -> Option<(K, V)> {
+        if rank >= self.len {
+            return None;
+        }
+        let root = self.root?;
+        let mut path = Path::new();
+        let (leaf_handle, idx) = self.descend_to_rank(root, rank, &mut path);
         Some(self.remove_at(leaf_handle, idx, &mut path))
     }
 
@@ -1379,6 +1440,17 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         self.remove_from_parent_and_propagate(path, separator_idx);
     }
 
+    /// Descends to the element at `rank`, recording the path. Returns its leaf and index.
+    fn descend_to_rank(&self, root: Handle, rank: usize, path: &mut Path) -> (Handle, usize) {
+        let mut remaining = rank;
+        let leaf = self.descend_with_path(root, path, |internal| {
+            let (child, before) = child_for_rank(internal, remaining).expect("`descend_to_rank()` - rank in range");
+            remaining -= before;
+            child
+        });
+        (leaf, remaining)
+    }
+
     /// Returns the position of the element with the given rank.
     fn locate_rank(&self, rank: usize) -> Option<(Handle, usize)> {
         if rank >= self.len {
@@ -1428,6 +1500,40 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             SearchResult::Found(idx) => Some(rank + idx),
             SearchResult::NotFound(_) => None,
         }
+    }
+
+    /// Returns the rank of a key together with the stored key-value pair.
+    pub(crate) fn get_with_rank<Q>(&self, key: &Q) -> Option<(usize, &K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        let (_, leaf, rank) = self.find_leaf_with_rank(key)?;
+        let SearchResult::Found(idx) = leaf.search(key) else {
+            return None;
+        };
+        Some((rank + idx, leaf.key(idx), self.values.get(leaf.value(idx))))
+    }
+
+    /// Returns the rank of a key together with the stored key and a mutable reference to its value.
+    pub(crate) fn get_with_rank_mut<Q>(&mut self, key: &Q) -> Option<(usize, &K, &mut V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        let root = self.root?;
+        let mut rank = 0;
+        let leaf_handle = self.descend(root, |_, internal| {
+            let child_idx = internal.search_child(key);
+            rank += size_before(internal, child_idx);
+            child_idx
+        });
+        // `nodes` and `values` are disjoint fields, so both can be borrowed at once.
+        let leaf = self.nodes.get(leaf_handle).as_leaf();
+        let SearchResult::Found(idx) = leaf.search(key) else {
+            return None;
+        };
+        Some((rank + idx, leaf.key(idx), self.values.get_mut(leaf.value(idx))))
     }
 
     /// Locates the split point for `key`: the leaf it falls in, how many of that leaf's
@@ -1522,6 +1628,11 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             _ => RangeCursor::default(),
         }
     }
+}
+
+/// Returns the number of elements in the children of `internal` before `child_idx`.
+fn size_before<K>(internal: &InternalNode<K>, child_idx: usize) -> usize {
+    internal.child_sizes()[..child_idx].iter().map(|s| s.to_usize()).sum()
 }
 
 /// Returns the index of the child of `internal` holding the element `rank` positions into its
@@ -2010,6 +2121,175 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Operations that exercise the `_with_rank` methods and `remove_by_rank`.
+    #[derive(Clone, Debug)]
+    enum RankOp {
+        Insert(i32),
+        Remove(i32),
+        Get(i32),
+        GetMut(i32),
+        RemoveByRank(usize),
+    }
+
+    fn rank_op_strategy() -> impl Strategy<Value = RankOp> {
+        prop_oneof![
+            4 => (0i32..1000).prop_map(RankOp::Insert),
+            2 => (0i32..1000).prop_map(RankOp::Remove),
+            2 => (0i32..1000).prop_map(RankOp::Get),
+            1 => (0i32..1000).prop_map(RankOp::GetMut),
+            // Reaches past the end, so out-of-range ranks are covered too.
+            1 => (0usize..800).prop_map(RankOp::RemoveByRank),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// Each `_with_rank` method agrees with the two-call form it replaces, and
+        /// `remove_by_rank` agrees with `Vec::remove` on a sorted model.
+        #[test]
+        fn with_rank_methods_match_two_call_form(ops in prop::collection::vec(rank_op_strategy(), 0..600)) {
+            let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+            let mut model: Vec<(i32, i32)> = Vec::new();
+
+            for op in ops {
+                match op {
+                    RankOp::Insert(key) => {
+                        let (rank, old) = tree.insert_with_rank(key, key * 2);
+                        prop_assert_eq!(Some(rank), tree.rank_of(&key));
+                        match model.binary_search_by_key(&key, |&(k, _)| k) {
+                            Ok(i) => {
+                                prop_assert_eq!(rank, i);
+                                prop_assert_eq!(old, Some(core::mem::replace(&mut model[i].1, key * 2)));
+                            }
+                            Err(i) => {
+                                prop_assert_eq!(rank, i);
+                                prop_assert_eq!(old, None);
+                                model.insert(i, (key, key * 2));
+                            }
+                        }
+                    }
+                    RankOp::Remove(key) => {
+                        let expected_rank = tree.rank_of(&key);
+                        let removed = tree.remove_entry_with_rank(&key);
+                        let expected = model
+                            .binary_search_by_key(&key, |&(k, _)| k)
+                            .ok()
+                            .map(|i| { let (k, v) = model.remove(i); (i, k, v) });
+                        prop_assert_eq!(removed.map(|(r, _, _)| r), expected_rank);
+                        prop_assert_eq!(removed, expected);
+                    }
+                    RankOp::Get(key) => {
+                        let expected = tree.rank_of(&key).map(|r| (r, tree.get_key_value(&key).unwrap()));
+                        let got = tree.get_with_rank(&key).map(|(r, k, v)| (r, (k, v)));
+                        prop_assert_eq!(got, expected);
+                    }
+                    RankOp::GetMut(key) => {
+                        let expected_rank = tree.rank_of(&key);
+                        let got = tree.get_with_rank_mut(&key).map(|(rank, k, v)| {
+                            *v += 1;
+                            (rank, *k)
+                        });
+                        prop_assert_eq!(got, expected_rank.map(|rank| (rank, key)));
+                        if let Some(rank) = expected_rank {
+                            model[rank].1 += 1;
+                        }
+                    }
+                    RankOp::RemoveByRank(rank) => {
+                        let expected = (rank < model.len()).then(|| model.remove(rank));
+                        prop_assert_eq!(tree.remove_by_rank(rank), expected);
+                    }
+                }
+
+                tree.validate_invariants();
+                prop_assert_eq!(tree.len(), model.len());
+            }
+
+            let entries: Vec<(i32, i32)> = (0..tree.len()).map(|r| { let (k, v) = tree.get_by_rank(r).unwrap(); (*k, *v) }).collect();
+            prop_assert_eq!(entries, model);
+        }
+    }
+
+    /// Number of levels in `tree`, counting the leaves.
+    fn tree_height<K, V>(tree: &RawOSBTreeMap<K, V>) -> usize {
+        let mut height = 0;
+        let mut node = tree.root;
+        while let Some(handle) = node {
+            height += 1;
+            node = match tree.nodes.get(handle) {
+                Node::Internal(internal) => Some(internal.child(0)),
+                Node::Leaf(_) => None,
+            };
+        }
+        height
+    }
+
+    /// Inserting into a full root leaf splits it, and with it the root. The rank must be right
+    /// wherever the new key lands: in the left half, at the split point, or in the right half.
+    #[test]
+    fn insert_with_rank_across_a_root_leaf_split() {
+        for position in 0..=MAX_KEYS {
+            let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+            for i in 0..MAX_KEYS as i32 {
+                tree.insert(i * 2, 0);
+            }
+            assert_eq!(tree_height(&tree), 1);
+
+            let key = position as i32 * 2 - 1;
+            assert_eq!(tree.insert_with_rank(key, 1), (position, None), "position = {position}");
+            assert_eq!(tree_height(&tree), 2, "position = {position}");
+            assert_eq!(tree.rank_of(&key), Some(position));
+            tree.validate_invariants();
+        }
+    }
+
+    /// Ascending and descending inserts split leaves and internal nodes at every level; each
+    /// insert reports the rank the key ends up at.
+    #[test]
+    fn insert_with_rank_through_internal_splits() {
+        let n = MAX_KEYS * MAX_KEYS * 3;
+
+        let mut ascending: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        for i in 0..n {
+            assert_eq!(ascending.insert_with_rank(i as i32, 0), (i, None));
+        }
+        ascending.validate_invariants();
+        assert!(tree_height(&ascending) >= 3);
+
+        let mut descending: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        for i in (0..n).rev() {
+            assert_eq!(descending.insert_with_rank(i as i32, 0), (0, None));
+        }
+        descending.validate_invariants();
+
+        // Present keys report their rank and keep their position.
+        for i in [0, n / 2, n - 1] {
+            assert_eq!(ascending.insert_with_rank(i as i32, 1), (i, Some(0)));
+        }
+    }
+
+    #[test]
+    fn with_rank_methods_on_empty_and_single_element_trees() {
+        let mut tree: RawOSBTreeMap<i32, i32> = RawOSBTreeMap::new();
+        assert_eq!(tree.get_with_rank(&1), None);
+        assert_eq!(tree.get_with_rank_mut(&1), None);
+        assert_eq!(tree.remove_entry_with_rank(&1), None);
+        assert_eq!(tree.remove_by_rank(0), None);
+
+        assert_eq!(tree.insert_with_rank(1, 10), (0, None));
+        assert_eq!(tree.get_with_rank(&1), Some((0, &1, &10)));
+        assert_eq!(tree.get_with_rank(&2), None);
+        assert_eq!(tree.remove_by_rank(1), None);
+        assert_eq!(tree.remove_entry_with_rank(&2), None);
+        assert_eq!(tree.remove_entry_with_rank(&1), Some((0, 1, 10)));
+        tree.validate_invariants();
+
+        tree.insert(1, 10);
+        assert_eq!(tree.remove_by_rank(0), Some((1, 10)));
+        assert_eq!(tree.len(), 0);
+        tree.validate_invariants();
     }
 
     #[test]

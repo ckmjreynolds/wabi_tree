@@ -312,6 +312,86 @@ fn bench_map_remove_random(c: &mut Criterion) {
     group.finish();
 }
 
+/// Compares each `_with_rank` method against the `rank_of` + plain-method pair it replaces, on
+/// random keys.
+fn bench_map_rank_ops(c: &mut Criterion) {
+    let keys = random_keys(N);
+    let full = || keys.iter().map(|&k| (k, k)).collect::<OSBTreeMap<i64, i64>>();
+
+    let mut group = c.benchmark_group("map_rank_get_random");
+    let map = full();
+    group.bench_function(BenchmarkId::new("rank_of+get", N), |b| {
+        b.iter(|| {
+            for &k in &keys {
+                std::hint::black_box((map.rank_of(&k), map.get(&k)));
+            }
+        });
+    });
+    group.bench_function(BenchmarkId::new("get_with_rank", N), |b| {
+        b.iter(|| {
+            for &k in &keys {
+                std::hint::black_box(map.get_with_rank(&k));
+            }
+        });
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("map_rank_insert_random");
+    group.bench_function(BenchmarkId::new("insert+rank_of", N), |b| {
+        b.iter_batched(
+            OSBTreeMap::<i64, i64>::new,
+            |mut map| {
+                for &k in &keys {
+                    map.insert(k, k);
+                    std::hint::black_box(map.rank_of(&k));
+                }
+                map
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function(BenchmarkId::new("insert_with_rank", N), |b| {
+        b.iter_batched(
+            OSBTreeMap::<i64, i64>::new,
+            |mut map| {
+                for &k in &keys {
+                    std::hint::black_box(map.insert_with_rank(k, k));
+                }
+                map
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("map_rank_remove_random");
+    group.bench_function(BenchmarkId::new("rank_of+remove", N), |b| {
+        b.iter_batched(
+            full,
+            |mut map| {
+                for &k in &keys {
+                    std::hint::black_box((map.rank_of(&k), map.remove(&k)));
+                }
+                map
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function(BenchmarkId::new("remove_with_rank", N), |b| {
+        b.iter_batched(
+            full,
+            |mut map| {
+                for &k in &keys {
+                    std::hint::black_box(map.remove_with_rank(&k));
+                }
+                map
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 // ─── Set Benchmarks ─────────────────────────────────────────────────────────
 
 fn bench_set_insert_ordered(c: &mut Criterion) {
@@ -758,6 +838,8 @@ criterion_group!(collect_benches, bench_map_collect, bench_set_collect);
 
 criterion_group!(split_append_benches, bench_map_split_off, bench_map_append);
 
+criterion_group!(rank_benches, bench_map_rank_ops);
+
 criterion_main!(
     map_insert_benches,
     map_get_benches,
@@ -768,4 +850,5 @@ criterion_main!(
     set_relation_benches,
     collect_benches,
     split_append_benches,
+    rank_benches,
 );

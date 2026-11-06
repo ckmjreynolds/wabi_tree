@@ -6,6 +6,15 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+### Added
+- `remove_by_rank` on `OSBTreeMap` and `OSBTreeSet` removes the element at a sorted position,
+  returning `None` if the rank is out of bounds (#31).
+- `_with_rank` variants that return the element's rank from the same walk down the tree, where
+  `rank_of` plus the plain method walks it twice (#31):
+  - `OSBTreeMap`: `get_with_rank`, `get_with_rank_mut`, `insert_with_rank` (rank after inserting)
+    and `remove_with_rank` (rank before removing).
+  - `OSBTreeSet`: `get_with_rank`, `insert_with_rank`, `remove_with_rank` and `take_with_rank`.
+
 ### Performance
 - `OSBTreeMap::entry` now records its path down the tree, so `VacantEntry::insert` (and with it
   `or_insert`, `or_insert_with` and `or_default`) and `OccupiedEntry::remove` no longer walk down
