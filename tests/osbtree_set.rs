@@ -1850,3 +1850,81 @@ fn append_equal_values_keep_the_one_in_self() {
         assert_eq!(items, expected);
     }
 }
+
+// ─── `_with_rank` and `remove_by_rank` (compared against BTreeSet) ───────────
+
+#[derive(Debug, Clone)]
+enum RankOp {
+    Insert(i64),
+    Remove(i64),
+    Take(i64),
+    Get(i64),
+    RemoveByRank(usize),
+}
+
+fn rank_op_strategy() -> impl Strategy<Value = RankOp> {
+    prop_oneof![
+        4 => value_strategy().prop_map(RankOp::Insert),
+        1 => value_strategy().prop_map(RankOp::Remove),
+        1 => value_strategy().prop_map(RankOp::Take),
+        2 => value_strategy().prop_map(RankOp::Get),
+        1 => (0usize..TEST_SIZE).prop_map(RankOp::RemoveByRank),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// Replays random operations on an `OSBTreeSet` through the `_with_rank` methods and on a
+    /// `BTreeSet` through the plain ones, deriving each expected rank from the `BTreeSet`.
+    #[test]
+    fn with_rank_methods_match_btreeset(ops in proptest::collection::vec(rank_op_strategy(), TEST_SIZE)) {
+        let mut os_set: OSBTreeSet<i64> = OSBTreeSet::new();
+        let mut bt_set: BTreeSet<i64> = BTreeSet::new();
+
+        for op in ops {
+            match op {
+                RankOp::Insert(v) => {
+                    let inserted = bt_set.insert(v);
+                    let rank = bt_set.range(..v).count();
+                    prop_assert_eq!(os_set.insert_with_rank(v), (rank, inserted));
+                }
+                RankOp::Remove(v) => {
+                    let rank = bt_set.range(..v).count();
+                    let expected = bt_set.remove(&v).then_some(rank);
+                    prop_assert_eq!(os_set.remove_with_rank(&v), expected);
+                }
+                RankOp::Take(v) => {
+                    let rank = bt_set.range(..v).count();
+                    let expected = bt_set.take(&v).map(|v| (rank, v));
+                    prop_assert_eq!(os_set.take_with_rank(&v), expected);
+                }
+                RankOp::Get(v) => {
+                    let expected = bt_set.get(&v).map(|v| (bt_set.range(..v).count(), v));
+                    prop_assert_eq!(os_set.get_with_rank(&v), expected);
+                }
+                RankOp::RemoveByRank(rank) => {
+                    let expected = bt_set.iter().nth(rank).copied().inspect(|v| { bt_set.remove(v); });
+                    prop_assert_eq!(os_set.remove_by_rank(rank), expected);
+                }
+            }
+            prop_assert_eq!(os_set.len(), bt_set.len());
+        }
+
+        prop_assert!(os_set.iter().eq(bt_set.iter()));
+    }
+}
+
+#[test]
+fn with_rank_methods_take_borrowed_values() {
+    let mut set: OSBTreeSet<String> = ["b", "d", "f"].into_iter().map(String::from).collect();
+
+    assert_eq!(set.get_with_rank("d"), Some((1, &"d".to_string())));
+    assert_eq!(set.insert_with_rank("a".to_string()), (0, true));
+    assert_eq!(set.insert_with_rank("a".to_string()), (0, false));
+    assert_eq!(set.remove_with_rank("b"), Some(1));
+    assert_eq!(set.take_with_rank("f"), Some((2, "f".to_string())));
+    assert_eq!(set.take_with_rank("z"), None);
+    assert_eq!(set.remove_by_rank(1), Some("d".to_string()));
+    assert_eq!(set.remove_by_rank(1), None);
+}

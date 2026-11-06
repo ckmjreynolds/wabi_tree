@@ -12,6 +12,8 @@ Order-statistic B-tree collections for Rust.
 
 - **`get_by_rank(rank)`** - Get the element at a given sorted position
 - **`rank_of(key)`** - Get the sorted position of a key
+- **`remove_by_rank(rank)`** - Remove the element at a given sorted position
+- **`get_with_rank(key)`, `insert_with_rank(key, value)`, `remove_with_rank(key)`** - Look up, insert or remove by key and get the element's sorted position from the same walk down the tree
 - **Indexing by `Rank`** - e.g., `map[Rank(0)]` for the first element
 
 ## Features
@@ -67,6 +69,11 @@ All standard `BTreeMap` methods are supported, plus:
 | `get_by_rank(rank)` | Get key-value pair at sorted position | O(log n) |
 | `get_by_rank_mut(rank)` | Get key and mutable value at sorted position | O(log n) |
 | `rank_of(key)` | Get the sorted position of a key | O(log n) |
+| `remove_by_rank(rank)` | Remove key-value pair at sorted position | O(log n) |
+| `get_with_rank(key)` | Get rank, key and value | O(log n) |
+| `get_with_rank_mut(key)` | Get rank, key and mutable value | O(log n) |
+| `insert_with_rank(key, value)` | Insert and get the key's rank afterwards | O(log n) |
+| `remove_with_rank(key)` | Remove and get the key's rank beforehand | O(log n) |
 | `map[Rank(i)]` | Index by rank (panics if out of bounds) | O(log n) |
 
 ### OSBTreeSet
@@ -77,6 +84,10 @@ All standard `BTreeSet` methods are supported, plus:
 |--------|-------------|------------|
 | `get_by_rank(rank)` | Get element at sorted position | O(log n) |
 | `rank_of(value)` | Get the sorted position of a value | O(log n) |
+| `remove_by_rank(rank)` | Remove element at sorted position | O(log n) |
+| `get_with_rank(value)` | Get rank and element | O(log n) |
+| `insert_with_rank(value)` | Insert and get the value's rank afterwards | O(log n) |
+| `remove_with_rank(value)` / `take_with_rank(value)` | Remove and get the value's rank beforehand | O(log n) |
 | `set[Rank(i)]` | Index by rank (panics if out of bounds) | O(log n) |
 
 ### Core Operations Complexity
