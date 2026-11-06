@@ -2443,7 +2443,6 @@ mod tests {
         #[test]
         fn entries_match_btreemap(ops in proptest::collection::vec(entry_op(), 0..2000)) {
             use alloc::collections::BTreeMap;
-            use alloc::collections::btree_map;
             use proptest::prelude::*;
 
             let mut map = OSBTreeMap::new();
@@ -2463,11 +2462,8 @@ mod tests {
                             Entry::Vacant(e) => *e.insert_entry(v).get(),
                             Entry::Occupied(e) => *e.get(),
                         };
-                        let want = match model.entry(k) {
-                            btree_map::Entry::Vacant(e) => *e.insert_entry(v).get(),
-                            btree_map::Entry::Occupied(e) => *e.get(),
-                        };
-                        prop_assert_eq!(got, want);
+                        // `btree_map::VacantEntry::insert_entry` is newer than the MSRV.
+                        prop_assert_eq!(got, *model.entry(k).or_insert(v));
                     }
                     EntryOp::Remove(k) => {
                         let got = match map.entry(k) {
