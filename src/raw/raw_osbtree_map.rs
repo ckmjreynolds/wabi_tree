@@ -1,6 +1,7 @@
 use core::borrow::Borrow;
 use core::ops::{Bound, RangeBounds};
 
+use alloc::boxed::Box;
 use smallvec::SmallVec;
 
 use super::arena::Arena;
@@ -29,6 +30,14 @@ pub(crate) struct RawOSBTreeMap<K, V> {
     first_leaf: Option<Handle>,
     /// Handle to the last (rightmost) leaf, for backward iteration.
     last_leaf: Option<Handle>,
+    /// The descent path recorded by the last [`Self::search_recording_path`], so an entry can
+    /// insert or remove without walking down from the root again. Boxed so the tree grows by a
+    /// pointer, not a whole `Path`; the box is allocated on first use and then reused.
+    ///
+    /// Only an entry that recorded the path may consume it, and only while it holds the tree's
+    /// unique borrow. No entry method changes the tree's shape before consuming the entry, so
+    /// the path can't go stale. Nothing else reads it, so it is never cloned or kept in sync.
+    entry_path: Option<Box<Path>>,
 }
 
 /// Positions of the first and last elements of a range, plus its length.
@@ -250,6 +259,7 @@ impl<K, V> RawOSBTreeMap<K, V> {
             len: 0,
             first_leaf: None,
             last_leaf: None,
+            entry_path: None,
         }
     }
 
@@ -267,6 +277,7 @@ impl<K, V> RawOSBTreeMap<K, V> {
             len: 0,
             first_leaf: None,
             last_leaf: None,
+            entry_path: None,
         }
     }
 
@@ -665,6 +676,28 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
         }
     }
 
+    /// Searches for `key` like [`Self::search`], recording the descent path for a following
+    /// [`Self::insert_at_recorded`] or [`Self::remove_at_recorded`].
+    ///
+    /// Returns `Ok((leaf, index))` if the key is present, `Err(Some((leaf, index)))` with the
+    /// position it would be inserted at if not, and `Err(None)` if the tree is empty.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn search_recording_path<Q>(&mut self, key: &Q) -> Result<(Handle, usize), Option<(Handle, usize)>>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        let root = self.root.ok_or(None)?;
+        let mut path = self.entry_path.take().unwrap_or_default();
+        path.clear();
+        let leaf_handle = self.descend_with_path(root, &mut path, |internal| internal.search_child(key));
+        self.entry_path = Some(path);
+        match self.nodes.get(leaf_handle).as_leaf().search(key) {
+            SearchResult::Found(idx) => Ok((leaf_handle, idx)),
+            SearchResult::NotFound(idx) => Err(Some((leaf_handle, idx))),
+        }
+    }
+
     /// Returns the key-value pair at a position.
     fn entry_at(&self, (leaf_handle, idx): (Handle, usize)) -> (&K, &V) {
         let leaf = self.nodes.get(leaf_handle).as_leaf();
@@ -732,18 +765,30 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
     /// and the old value if the key was already present. Value handles are stable across
     /// node splits, so the handle stays valid until the entry is removed.
     pub(crate) fn insert_with_handle(&mut self, key: K, value: V) -> (Handle, Option<V>) {
-        self.insert_impl(key, value, false)
+        let (value_handle, _, old_value) = self.insert_impl(key, value, false);
+        (value_handle, old_value)
+    }
+
+    /// Inserts a key-value pair into the tree, returning the position `(leaf, index)` the key
+    /// now occupies and the old value if the key was already present. The position stays
+    /// valid until the tree is next modified structurally.
+    pub(crate) fn insert_with_position(&mut self, key: K, value: V) -> ((Handle, usize), Option<V>) {
+        let (_, position, old_value) = self.insert_impl(key, value, false);
+        (position, old_value)
     }
 
     /// Inserts a key-value pair, but if an equal key is present, replaces only the key and keeps
     /// the stored value. Returns `value` if it was not stored.
     pub(crate) fn insert_key_keep_value(&mut self, key: K, value: V) -> Option<V> {
-        self.insert_impl(key, value, true).1
+        self.insert_impl(key, value, true).2
     }
 
     /// Inserts `key` and `value`. If an equal key is present, `keep_value` chooses between
     /// replacing the value (returning the old one) and replacing the key (returning `value`).
-    fn insert_impl(&mut self, key: K, value: V, keep_value: bool) -> (Handle, Option<V>) {
+    ///
+    /// Returns the handle of the stored value, the position `(leaf, index)` of the key, and the
+    /// value that was not kept, if any.
+    fn insert_impl(&mut self, key: K, value: V, keep_value: bool) -> (Handle, (Handle, usize), Option<V>) {
         let Some(root) = self.root else {
             let value_handle = self.values.alloc(value);
             let mut leaf = LeafNode::new();
@@ -753,7 +798,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             self.first_leaf = Some(leaf_handle);
             self.last_leaf = Some(leaf_handle);
             self.len = 1;
-            return (value_handle, None);
+            return (value_handle, (leaf_handle, 0), None);
         };
 
         let mut path = Path::new();
@@ -767,33 +812,78 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 if keep_value {
                     // An equal key compares the same as the old one, so separators stay valid.
                     leaf.replace_key(idx, key);
-                    return (value_handle, Some(value));
+                    return (value_handle, (current, idx), Some(value));
                 }
                 // Key exists, replace value in-place to avoid alloc/free churn
                 let old_value = core::mem::replace(self.values.get_mut(value_handle), value);
-                (value_handle, Some(old_value))
+                (value_handle, (current, idx), Some(old_value))
             }
             SearchResult::NotFound(idx) => {
-                // Insert new key-value
-                let value_handle = self.values.alloc(value);
-                leaf.insert(idx, key, value_handle);
-                self.len += 1;
-
-                // Count the new element before splitting: a split only clones keys, so if
-                // `K::clone` panics the tree is left consistent, with one oversized leaf.
-                let needs_split = leaf.key_count() > MAX_KEYS;
-                self.adjust_sizes_along_path(&path, |size| size + 1);
-                if needs_split {
-                    self.split_leaf_and_propagate(current, &mut path);
-                }
-
-                (value_handle, None)
+                let (value_handle, position) = self.insert_at(current, idx, key, value, &mut path);
+                (value_handle, position, None)
             }
         }
     }
 
-    /// Splits a leaf and propagates splits up the tree as needed.
-    fn split_leaf_and_propagate(&mut self, leaf_handle: Handle, path: &mut Path) {
+    /// Inserts a new key at `idx` in the leaf reached via `path`, splitting as needed. The key
+    /// must be absent and belong at that position. Returns the handle of the stored value and
+    /// the position `(leaf, index)` the key ends up at.
+    fn insert_at(
+        &mut self,
+        leaf_handle: Handle,
+        idx: usize,
+        key: K,
+        value: V,
+        path: &mut Path,
+    ) -> (Handle, (Handle, usize)) {
+        let value_handle = self.values.alloc(value);
+        let leaf = self.nodes.get_mut(leaf_handle).as_leaf_mut();
+        leaf.insert(idx, key, value_handle);
+        self.len += 1;
+
+        // Count the new element before splitting: a split only clones keys, so if
+        // `K::clone` panics the tree is left consistent, with one oversized leaf.
+        let needs_split = leaf.key_count() > MAX_KEYS;
+        self.adjust_sizes_along_path(path, |size| size + 1);
+        let mut position = (leaf_handle, idx);
+        if needs_split {
+            let (right_handle, left_count) = self.split_leaf_and_propagate(leaf_handle, path);
+            if idx >= left_count {
+                position = (right_handle, idx - left_count);
+            }
+        }
+        (value_handle, position)
+    }
+
+    /// Inserts `key` at the position a [`Self::search_recording_path`] for it returned as
+    /// `Err(Some((leaf_handle, idx)))`, using the path that search recorded. The tree must not
+    /// have been modified since.
+    pub(crate) fn insert_at_recorded(
+        &mut self,
+        leaf_handle: Handle,
+        idx: usize,
+        key: K,
+        value: V,
+    ) -> (Handle, (Handle, usize)) {
+        let mut path = self.entry_path.take().expect("search_recording_path recorded a path");
+        let inserted = self.insert_at(leaf_handle, idx, key, value, &mut path);
+        self.entry_path = Some(path);
+        inserted
+    }
+
+    /// Removes the element at the position a [`Self::search_recording_path`] returned as
+    /// `Ok((leaf_handle, idx))`, using the path that search recorded. The tree must not have
+    /// been modified since.
+    pub(crate) fn remove_at_recorded(&mut self, leaf_handle: Handle, idx: usize) -> (K, V) {
+        let mut path = self.entry_path.take().expect("search_recording_path recorded a path");
+        let removed = self.remove_at(leaf_handle, idx, &mut path);
+        self.entry_path = Some(path);
+        removed
+    }
+
+    /// Splits a leaf and propagates splits up the tree as needed. Returns the handle of the new
+    /// right leaf and the number of keys left in `leaf_handle`.
+    fn split_leaf_and_propagate(&mut self, leaf_handle: Handle, path: &mut Path) -> (Handle, usize) {
         let leaf = self.nodes.get_mut(leaf_handle).as_leaf_mut();
         let (separator, mut right_leaf) = leaf.split();
 
@@ -825,6 +915,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
 
         // Propagate the split up
         self.propagate_split(path, separator, right_handle, left_size, right_size);
+        (right_handle, left_size.to_usize())
     }
 
     /// Propagates a split up the tree. Sizes along `path` must already count the inserted
@@ -2497,5 +2588,29 @@ mod tests {
         // The second leaf's first key is smaller than the first leaf's last key.
         let keys = (0..MAX_KEYS).chain([0]).chain(MAX_KEYS + 1..MAX_KEYS * 2);
         let _ = RawOSBTreeMap::from_sorted_iter(keys.map(|k| (k, ())).collect::<Vec<_>>());
+    }
+
+    /// `insert_with_position` must report where the key ended up, including after a leaf split
+    /// that moves it into the new right leaf and after splits that grow a new root.
+    #[test]
+    fn insert_with_position_reports_final_position() {
+        let n = MAX_KEYS * MAX_KEYS * 3;
+        let orders: [Vec<usize>; 3] =
+            [(0..n).collect(), (0..n).rev().collect(), (0..n).map(|i| (i * 7919) % n).collect()];
+        for keys in orders {
+            let mut tree = RawOSBTreeMap::new();
+            for &key in &keys {
+                let ((leaf, idx), old) = tree.insert_with_position(key, key * 2);
+                assert_eq!(old, None);
+                assert_eq!(*tree.node(leaf).as_leaf().key(idx), key);
+                assert_eq!(tree.entry_at((leaf, idx)), (&key, &(key * 2)));
+            }
+            tree.validate_invariants();
+            for &key in &keys {
+                let ((leaf, idx), old) = tree.insert_with_position(key, key * 3);
+                assert_eq!(old, Some(key * 2));
+                assert_eq!(tree.entry_at((leaf, idx)), (&key, &(key * 3)));
+            }
+        }
     }
 }

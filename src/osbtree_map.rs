@@ -683,6 +683,7 @@ impl<K, V> OSBTreeMap<K, V> {
             key,
             leaf_handle,
             index,
+            recorded_path: false,
             tree: &mut self.raw,
         })
     }
@@ -775,6 +776,7 @@ impl<K, V> OSBTreeMap<K, V> {
             key,
             leaf_handle,
             index,
+            recorded_path: false,
             tree: &mut self.raw,
         })
     }
@@ -1157,18 +1159,19 @@ impl<K, V> OSBTreeMap<K, V> {
     where
         K: Ord + Clone,
     {
-        if let Some((leaf_handle, index)) = self.raw.search(&key) {
-            Entry::Occupied(OccupiedEntry {
+        match self.raw.search_recording_path(&key) {
+            Ok((leaf_handle, index)) => Entry::Occupied(OccupiedEntry {
                 key,
                 leaf_handle,
                 index,
+                recorded_path: true,
                 tree: &mut self.raw,
-            })
-        } else {
-            Entry::Vacant(VacantEntry {
+            }),
+            Err(position) => Entry::Vacant(VacantEntry {
                 key,
+                position,
                 tree: &mut self.raw,
-            })
+            }),
         }
     }
 
@@ -2402,5 +2405,101 @@ mod tests {
 
         assert_eq!(map.range(..).next(), None);
         assert_eq!(map.range_mut(..).next(), None);
+    }
+
+    #[derive(Debug, Clone)]
+    enum EntryOp {
+        OrInsert(u16, u32),
+        InsertEntryThenRemove(u16, u32),
+        InsertEntry(u16, u32),
+        Remove(u16),
+        ModifyThenRemove(u16),
+        FirstEntryRemove,
+        LastEntryRemove,
+        DirectInsert(u16, u32),
+        DirectRemove(u16),
+    }
+
+    fn entry_op() -> impl proptest::strategy::Strategy<Value = EntryOp> {
+        use proptest::prelude::*;
+        // A small key space, so ops hit present keys as often as absent ones.
+        let key = 0u16..600;
+        prop_oneof![
+            4 => (key.clone(), any::<u32>()).prop_map(|(k, v)| EntryOp::OrInsert(k, v)),
+            1 => (key.clone(), any::<u32>()).prop_map(|(k, v)| EntryOp::InsertEntryThenRemove(k, v)),
+            1 => (key.clone(), any::<u32>()).prop_map(|(k, v)| EntryOp::InsertEntry(k, v)),
+            3 => key.clone().prop_map(EntryOp::Remove),
+            1 => key.clone().prop_map(EntryOp::ModifyThenRemove),
+            1 => Just(EntryOp::FirstEntryRemove),
+            1 => Just(EntryOp::LastEntryRemove),
+            1 => (key.clone(), any::<u32>()).prop_map(|(k, v)| EntryOp::DirectInsert(k, v)),
+            1 => key.prop_map(EntryOp::DirectRemove),
+        ]
+    }
+
+    proptest::proptest! {
+        /// Entries insert and remove through the path their search recorded (#32). Mixing them
+        /// with direct calls and first/last entries checks the path is never used stale.
+        #[test]
+        fn entries_match_btreemap(ops in proptest::collection::vec(entry_op(), 0..2000)) {
+            use alloc::collections::BTreeMap;
+            use alloc::collections::btree_map;
+            use proptest::prelude::*;
+
+            let mut map = OSBTreeMap::new();
+            let mut model = BTreeMap::new();
+            for op in ops {
+                match op {
+                    EntryOp::OrInsert(k, v) => {
+                        prop_assert_eq!(*map.entry(k).or_insert(v), *model.entry(k).or_insert(v));
+                    }
+                    EntryOp::InsertEntryThenRemove(k, v) => {
+                        if let Entry::Vacant(e) = map.entry(k) {
+                            prop_assert_eq!(e.insert_entry(v).remove_entry(), (k, v));
+                        }
+                    }
+                    EntryOp::InsertEntry(k, v) => {
+                        let got = match map.entry(k) {
+                            Entry::Vacant(e) => *e.insert_entry(v).get(),
+                            Entry::Occupied(e) => *e.get(),
+                        };
+                        let want = match model.entry(k) {
+                            btree_map::Entry::Vacant(e) => *e.insert_entry(v).get(),
+                            btree_map::Entry::Occupied(e) => *e.get(),
+                        };
+                        prop_assert_eq!(got, want);
+                    }
+                    EntryOp::Remove(k) => {
+                        let got = match map.entry(k) {
+                            Entry::Occupied(e) => Some(e.remove_entry()),
+                            Entry::Vacant(_) => None,
+                        };
+                        prop_assert_eq!(got, model.remove_entry(&k));
+                    }
+                    EntryOp::ModifyThenRemove(k) => {
+                        if let Entry::Occupied(mut e) = map.entry(k) {
+                            *e.get_mut() = e.insert(7) + 1;
+                            prop_assert_eq!(e.remove(), model[&k] + 1);
+                            model.remove(&k);
+                        }
+                    }
+                    EntryOp::FirstEntryRemove => {
+                        prop_assert_eq!(map.first_entry().map(OccupiedEntry::remove_entry), model.pop_first());
+                    }
+                    EntryOp::LastEntryRemove => {
+                        prop_assert_eq!(map.last_entry().map(OccupiedEntry::remove_entry), model.pop_last());
+                    }
+                    EntryOp::DirectInsert(k, v) => {
+                        prop_assert_eq!(map.insert(k, v), model.insert(k, v));
+                    }
+                    EntryOp::DirectRemove(k) => {
+                        prop_assert_eq!(map.remove(&k), model.remove(&k));
+                    }
+                }
+                map.raw.validate_invariants();
+                prop_assert_eq!(map.len(), model.len());
+            }
+            prop_assert!(map.iter().eq(model.iter()));
+        }
     }
 }
