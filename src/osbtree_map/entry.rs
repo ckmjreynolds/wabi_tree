@@ -62,6 +62,9 @@ impl<K: fmt::Debug + Ord + Clone, V: fmt::Debug> fmt::Debug for Entry<'_, K, V> 
 /// ```
 pub struct VacantEntry<'a, K, V> {
     pub(crate) key: K,
+    /// Where the key belongs, from the search that made this entry; `None` if the tree is empty.
+    /// The tree holds that search's path, so inserting doesn't walk down from the root again.
+    pub(crate) position: Option<(Handle, usize)>,
     pub(crate) tree: &'a mut RawOSBTreeMap<K, V>,
 }
 
@@ -92,6 +95,9 @@ pub struct OccupiedEntry<'a, K, V> {
     pub(crate) key: K,
     pub(crate) leaf_handle: Handle,
     pub(crate) index: usize,
+    /// Whether the tree holds the descent path to this entry, recorded by the search that made
+    /// it. If so, removing uses that path; if not, removing searches for the key again.
+    pub(crate) recorded_path: bool,
     pub(crate) tree: &'a mut RawOSBTreeMap<K, V>,
 }
 
@@ -357,7 +363,10 @@ impl<'a, K: Ord + Clone, V> VacantEntry<'a, K, V> {
     ///
     /// O(log n)
     pub fn insert(self, value: V) -> &'a mut V {
-        let (value_handle, _) = self.tree.insert_with_handle(self.key, value);
+        let value_handle = match self.position {
+            Some((leaf_handle, index)) => self.tree.insert_at_recorded(leaf_handle, index, self.key, value).0,
+            None => self.tree.insert_with_handle(self.key, value).0,
+        };
         self.tree.value_mut(value_handle)
     }
 
@@ -387,12 +396,17 @@ impl<'a, K: Ord + Clone, V> VacantEntry<'a, K, V> {
     ///
     /// O(log n)
     pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
-        self.tree.insert(self.key.clone(), value);
-        let (leaf_handle, index) = self.tree.search(&self.key).expect("just inserted");
+        let key = self.key.clone();
+        let (leaf_handle, index) = match self.position {
+            Some((leaf_handle, index)) => self.tree.insert_at_recorded(leaf_handle, index, key, value).1,
+            None => self.tree.insert_with_position(key, value).0,
+        };
+        // Inserting consumed the recorded path.
         OccupiedEntry {
             key: self.key,
             leaf_handle,
             index,
+            recorded_path: false,
             tree: self.tree,
         }
     }
@@ -453,7 +467,11 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     ///
     /// O(log n)
     pub fn remove_entry(self) -> (K, V) {
-        self.tree.remove_entry(&self.key).expect("entry must exist")
+        if self.recorded_path {
+            self.tree.remove_at_recorded(self.leaf_handle, self.index)
+        } else {
+            self.tree.remove_entry(&self.key).expect("entry must exist")
+        }
     }
 
     /// Gets a reference to the value in the entry.

@@ -247,3 +247,26 @@ fn collect_with_duplicates_and_heap_keys() {
     assert_eq!(set.len(), 600);
     assert_eq!(set.get_by_rank(599).map(String::as_str), Some("0599"));
 }
+
+/// Entries insert and remove through the path their search recorded (#32), including inserts
+/// that split leaves and removals that merge them.
+#[test]
+fn entries_split_and_merge_through_recorded_path() {
+    use wabi_tree::osbtree_map::Entry;
+
+    let mut map = OSBTreeMap::new();
+    for i in 0..400u32 {
+        *map.entry(i * 7 % 400).or_insert(0) += i;
+    }
+    if let Entry::Vacant(e) = map.entry(1000) {
+        assert_eq!(e.insert_entry(5).remove_entry(), (1000, 5));
+    }
+    for i in (0..400u32).step_by(2) {
+        match map.entry(i) {
+            Entry::Occupied(e) => assert_eq!(e.remove_entry().0, i),
+            Entry::Vacant(_) => panic!("{i} was inserted"),
+        }
+    }
+    assert_eq!(map.len(), 200);
+    assert!(map.keys().copied().eq((1..400).step_by(2)));
+}

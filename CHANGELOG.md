@@ -6,6 +6,13 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+### Performance
+- `OSBTreeMap::entry` now records its path down the tree, so `VacantEntry::insert` (and with it
+  `or_insert`, `or_insert_with` and `or_default`) and `OccupiedEntry::remove` no longer walk down
+  from the root a second time. Entry inserts and removes now cost the same as `insert` and
+  `remove`, where they were 10–35% slower before. `VacantEntry::insert_entry` also no longer
+  searches the tree again after inserting. The map grows by one pointer (#32).
+
 ## [0.1.5] - 2026-11-01
 
 ### Changed
