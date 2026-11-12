@@ -8,8 +8,8 @@ export NEXTEST_TEST_THREADS=${NEXTEST_TEST_THREADS:-4}
 cargo +stable fmt || exit
 cargo +stable clippy --all-targets -- -Dwarnings || exit
 # nextest doesn't run doc tests, so they get their own pass.
-cargo +stable nextest run --release || exit
 cargo +stable test --doc --release || exit
+cargo +stable nextest run --release || exit
 
 # Check the unsafe code paths for undefined behavior under both aliasing models. Miri is
 # single-threaded, so nextest runs each test in its own process to use every core.
