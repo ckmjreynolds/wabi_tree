@@ -6,6 +6,8 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-12
+
 ### Added
 - `remove_by_rank` on `OSBTreeMap` and `OSBTreeSet` removes the element at a sorted position,
   returning `None` if the rank is out of bounds (#31).
@@ -21,6 +23,28 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
   from the root a second time. Entry inserts and removes now cost the same as `insert` and
   `remove`, where they were 10–35% slower before. `VacantEntry::insert_entry` also no longer
   searches the tree again after inserting. The map grows by one pointer (#32).
+- `extract_if` on the map and set no longer collects and clones every key in the range before it
+  starts. It now passes over rejected elements along the leaves and walks down from the root only
+  to remove an element. On 1,000,000 `u64` keys it is 11× faster when nothing is extracted, 3.8×
+  when a tenth is, and 2.5× when everything is (#36).
+- `retain` on the map and set no longer clones the key of each element it removes, and removes
+  through the same walk as `extract_if`: about the same speed when a tenth of 1,000,000 `u64`
+  keys are removed, and 2.3× faster when all of them are (#36).
+- `OccupiedEntry::remove` and `remove_entry` on an entry from `first_entry` or `last_entry` no
+  longer clone the key and search for it: 2.3× faster (#36).
+- Lookups and removals by rank skip over a node's children sixteen at a time rather than one at
+  a time (#36).
+- Removing an element clones fewer keys: none when an internal node merges with or borrows from
+  its sibling, and none when the last element of the tree is removed, as `pop_last` does (#36).
+- `OSBTreeSet::replace` swaps the stored element in place rather than removing it and inserting
+  the new one (#36).
+
+### Changed
+- `retain` now removes each element as the predicate rejects it, as `BTreeMap` and `BTreeSet`
+  do. If the predicate panics, the elements it has already rejected are gone; before, nothing
+  was removed until the predicate had seen every element (#36).
+- The `Debug` output of `osbtree_map::ExtractIf` shows `rank` in place of `index` (#36).
+- Minimum `smallvec` version is now 1.16.5.
 
 ## [0.1.5] - 2026-11-01
 
@@ -122,7 +146,8 @@ The format is loosely based on Keep a Changelog, and this project follows Semant
 ### Added
 - Initial public release of `OSBTreeMap` and `OSBTreeSet` with rank operations.
 
-[Unreleased]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ckmjreynolds/wabi_tree/compare/v0.1.2...v0.1.3

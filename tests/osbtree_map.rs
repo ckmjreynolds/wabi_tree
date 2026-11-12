@@ -2551,6 +2551,8 @@ fn range_edge_cases() {
     let empty: OSBTreeMap<i32, i32> = OSBTreeMap::new();
     assert_eq!(empty.range(..).next(), None);
     assert_eq!(empty.range(1..).next(), None);
+    assert_eq!(empty.range(..1).next(), None);
+    assert_eq!(empty.range(..=1).next(), None);
 
     let map = OSBTreeMap::from([(10, 1), (20, 2)]);
     assert_eq!(map.range(..=5).next(), None);

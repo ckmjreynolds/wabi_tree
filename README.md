@@ -29,7 +29,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-wabi_tree = "0.1"
+wabi_tree = "0.2"
 ```
 
 ## Quick Start
