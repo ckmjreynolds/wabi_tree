@@ -1886,3 +1886,16 @@ fn with_rank_methods_take_borrowed_values() {
     assert_eq!(set.remove_by_rank(1), Some("d".to_string()));
     assert_eq!(set.remove_by_rank(1), None);
 }
+
+/// `difference` and `intersection` answer early for sets whose spans don't overlap, whichever
+/// of the two is the lower one.
+#[test]
+fn difference_and_intersection_of_non_overlapping_sets() {
+    let low: OSBTreeSet<i32> = (0..100).collect();
+    let high: OSBTreeSet<i32> = (200..300).collect();
+
+    assert!(low.difference(&high).eq(low.iter()));
+    assert!(high.difference(&low).eq(high.iter()));
+    assert_eq!(low.intersection(&high).next(), None);
+    assert_eq!(high.intersection(&low).next(), None);
+}

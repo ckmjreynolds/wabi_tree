@@ -1,6 +1,6 @@
 [package]
 name    = "wabi_tree"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -16,7 +16,7 @@ documentation   = "https://docs.rs/wabi_tree"
 include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
-smallvec = { version = "1.16.3", default-features = false, features = ["const_generics"] }
+smallvec = { version = "1.16.5", default-features = false, features = ["const_generics"] }
 
 [dev-dependencies]
 criterion = "0.8.2"

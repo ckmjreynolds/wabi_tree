@@ -329,21 +329,11 @@ impl<I: Iterator> MergeIterInner<I> {
     where
         I: FusedIterator,
     {
-        let a_next = match self.peeked.take() {
-            Some(Peeked::A(a)) => Some(a),
-            Some(Peeked::B(b)) => {
-                self.peeked = Some(Peeked::B(b));
-                self.a.next()
-            }
-            None => self.a.next(),
-        };
-        let b_next = match self.peeked.take() {
-            Some(Peeked::B(b)) => Some(b),
-            Some(Peeked::A(a)) => {
-                self.peeked = Some(Peeked::A(a));
-                self.b.next()
-            }
-            None => self.b.next(),
+        // At most one side has a peeked item, and it stands in for that side's next one.
+        let (a_next, b_next) = match self.peeked.take() {
+            Some(Peeked::A(a)) => (Some(a), self.b.next()),
+            Some(Peeked::B(b)) => (self.a.next(), Some(b)),
+            None => (self.a.next(), self.b.next()),
         };
 
         match (a_next, b_next) {
