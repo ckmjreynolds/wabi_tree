@@ -29,7 +29,8 @@ pub(crate) enum Node<K> {
 pub(crate) struct InternalNode<K> {
     // The number of key/value pairs in the subtree rooted at this node.
     size: Size,
-    // We define separator keys such that key[i] = child[i].max_key().
+    // Separator keys satisfy child[i].max_key() <= key[i] < child[i + 1].min_key(). A separator
+    // starts out equal to its left child's max key and may go stale after a removal.
     // +1 allows for more ergonomic split operations.
     keys: SmallVec<[K; MAX_KEYS + 1]>,
     children: SmallVec<[Handle; MAX_CHILDREN + 1]>,
@@ -62,7 +63,7 @@ impl<K> Node<K> {
         Node::Leaf(LeafNode::new())
     }
 
-    /// Creates a new internal node with given children.
+    /// Creates a new empty internal node.
     #[cfg(test)]
     pub(crate) fn new_internal() -> Self {
         Node::Internal(InternalNode::new())
@@ -109,6 +110,14 @@ impl<K> Node<K> {
         match self {
             Node::Internal(internal) => internal.child_count(),
             Node::Leaf(leaf) => leaf.key_count(),
+        }
+    }
+
+    /// Returns true if this node can lend an entry to a sibling without becoming underfull.
+    pub(crate) fn can_lend(&self) -> bool {
+        match self {
+            Node::Internal(internal) => internal.can_lend(),
+            Node::Leaf(leaf) => leaf.can_lend(),
         }
     }
 
@@ -192,7 +201,7 @@ impl<K> InternalNode<K> {
     }
 
     /// Returns true if this node is below minimum capacity and needs rebalancing.
-    pub(crate) fn is_at_minimum(&self) -> bool {
+    pub(crate) fn is_underfull(&self) -> bool {
         self.keys.len() < MIN_INTERNAL_KEYS
     }
 
@@ -271,7 +280,8 @@ impl<K> InternalNode<K> {
         K: Borrow<Q>,
         Q: ?Sized + Ord,
     {
-        // Keys[i] is the max key in child[i], so we find first key >= search key.
+        // Keys[i] is an upper bound on the keys in child[i] (and below every key in child[i + 1]),
+        // so we find first key >= search key.
         // Binary search returns Ok(i) if found, or Err(i) where i is insertion point.
         // In both cases, i is the correct child index.
         match self.keys.binary_search_by(|k| k.borrow().cmp(key)) {
@@ -302,22 +312,18 @@ impl<K> InternalNode<K> {
         self.child_sizes.push(child_size);
     }
 
-    /// Pushes a child to the front (only used during splits).
+    /// Pushes a child to the front, with the key separating it from the old first child.
     pub(crate) fn push_child_front(&mut self, key: K, child: Handle, child_size: Size) {
         self.keys.insert(0, key);
         self.children.insert(0, child);
         self.child_sizes.insert(0, child_size);
     }
 
-    /// Sets the first child (before any keys).
+    /// Gives an empty node its first child, the one before any keys.
     pub(crate) fn set_first_child(&mut self, child: Handle, child_size: Size) {
-        if self.children.is_empty() {
-            self.children.push(child);
-            self.child_sizes.push(child_size);
-        } else {
-            self.children[0] = child;
-            self.child_sizes[0] = child_size;
-        }
+        debug_assert!(self.children.is_empty(), "`set_first_child()` - node already has children");
+        self.children.push(child);
+        self.child_sizes.push(child_size);
     }
 
     /// Updates a separator key at the given index.
@@ -333,7 +339,7 @@ impl<K> InternalNode<K> {
         Some((key, child, size))
     }
 
-    /// Pops the first key and child (keeping the first child in place conceptually).
+    /// Pops the first child and the key that separated it from the next one.
     pub(crate) fn pop_child_front(&mut self) -> Option<(K, Handle, Size)> {
         if self.keys.is_empty() {
             None
@@ -484,7 +490,7 @@ impl<K> LeafNode<K> {
     }
 
     /// Returns true if this node is below minimum capacity and needs rebalancing.
-    pub(crate) fn is_at_minimum(&self) -> bool {
+    pub(crate) fn is_underfull(&self) -> bool {
         self.keys.len() < MIN_LEAF_KEYS
     }
 
@@ -729,7 +735,7 @@ mod tests {
     fn internal_accessors_and_empty_pops() {
         let mut internal: InternalNode<i32> = InternalNode::new();
         assert!(internal.has_room());
-        assert!(internal.is_at_minimum());
+        assert!(internal.is_underfull());
         assert!(!internal.can_lend());
         assert_eq!(internal.pop_child(), None);
         assert_eq!(internal.pop_child_front(), None);
@@ -755,7 +761,7 @@ mod tests {
     fn leaf_accessors_and_empty_pops() {
         let mut leaf: LeafNode<i32> = LeafNode::new();
         assert!(leaf.has_room());
-        assert!(leaf.is_at_minimum());
+        assert!(leaf.is_underfull());
         assert!(!leaf.can_lend());
         assert_eq!(leaf.pop(), None);
         assert_eq!(leaf.pop_front(), None);

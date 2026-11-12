@@ -15,7 +15,7 @@ impl Handle {
     #[inline]
     pub(crate) const fn from_index(index: usize) -> Self {
         assert!(index <= Self::MAX, "`Handle::from_index()` - `index` > `Handle::MAX`!");
-        // SAFETY: `index + 1` cannot be zero and cannot overflow.
+        // `index + 1` cannot be zero and cannot overflow.
         Self(NonZero::new((index + 1) as RawHandle).unwrap())
     }
 

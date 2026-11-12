@@ -249,6 +249,7 @@ pub struct ExtractIf<'a, T, R, F> {
     inner: ExtractIfInner<'a, T, (), R>,
 }
 
+#[derive(Debug)]
 enum DifferenceInner<'a, T: 'a> {
     Stitch {
         self_iter: Iter<'a, T>,
@@ -261,6 +262,7 @@ enum DifferenceInner<'a, T: 'a> {
     Iterate(Iter<'a, T>),
 }
 
+#[derive(Debug)]
 enum IntersectionInner<'a, T: 'a> {
     Stitch {
         a: Iter<'a, T>,
@@ -308,38 +310,6 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MergeIterInner").field("a", &self.a).field("b", &self.b).field("peeked", &self.peeked).finish()
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for DifferenceInner<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DifferenceInner::Stitch {
-                self_iter,
-                other_iter,
-            } => f.debug_struct("Stitch").field("self_iter", self_iter).field("other_iter", other_iter).finish(),
-            DifferenceInner::Search {
-                self_iter,
-                other_set,
-            } => f.debug_struct("Search").field("self_iter", self_iter).field("other_set", other_set).finish(),
-            DifferenceInner::Iterate(iter) => f.debug_tuple("Iterate").field(iter).finish(),
-        }
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for IntersectionInner<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IntersectionInner::Stitch {
-                a,
-                b,
-            } => f.debug_struct("Stitch").field("a", a).field("b", b).finish(),
-            IntersectionInner::Search {
-                small_iter,
-                large_set,
-            } => f.debug_struct("Search").field("small_iter", small_iter).field("large_set", large_set).finish(),
-            IntersectionInner::Answer(answer) => f.debug_tuple("Answer").field(answer).finish(),
-        }
     }
 }
 
@@ -1066,10 +1036,7 @@ impl<T> OSBTreeSet<T> {
     where
         T: Clone + Ord,
     {
-        // Remove the existing key if present, then insert the new one
-        let existing = self.map.remove_entry(&value).map(|(k, ())| k);
-        self.map.insert(value, ());
-        existing
+        self.map.replace_key(value, ())
     }
 
     /// If the set contains an element equal to the value, removes it from the
@@ -1146,7 +1113,7 @@ impl<T> OSBTreeSet<T> {
     ///
     /// # Complexity
     ///
-    /// O(n log n) in the worst case (when many elements are removed).
+    /// O(n + k log n) where k is the number of elements removed.
     pub fn retain<F>(&mut self, mut f: F)
     where
         T: Clone + Ord,
@@ -1281,9 +1248,10 @@ impl<T> OSBTreeSet<T> {
     ///
     /// # Complexity
     ///
-    /// O(m + k log n) where m is the number of elements in the range and k is
-    /// the number of elements extracted. All keys in the range are collected
-    /// upfront, then each extracted element requires a O(log n) removal.
+    /// O(m + k log n) where m is the number of elements in the range and k is the
+    /// number extracted: rejected elements are passed over along the leaves, and each
+    /// extracted one costs a descent. No values are cloned and nothing is allocated up
+    /// front, though removing an element may clone a value to rebalance the tree.
     pub fn extract_if<F, R>(&mut self, range: R, pred: F) -> ExtractIf<'_, T, R, F>
     where
         T: Clone + Ord,
@@ -1565,41 +1533,11 @@ impl<'a, T> IntoIterator for &'a OSBTreeSet<T> {
     }
 }
 
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<&'a T> {
-        self.inner.next()
-    }
-
-    fn nth(&mut self, n: usize) -> Option<&'a T> {
-        self.inner.nth(n)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
+forward_iterator! {
+    impl['a, T] Iter<'a, T>;
+    Item = &'a T;
+    terminals = sorted;
 }
-
-impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
-    fn next_back(&mut self) -> Option<&'a T> {
-        self.inner.next_back()
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<&'a T> {
-        self.inner.nth_back(n)
-    }
-}
-
-impl<T> ExactSizeIterator for Iter<'_, T> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<T> FusedIterator for Iter<'_, T> {}
 
 impl<T> Clone for Iter<'_, T> {
     fn clone(&self) -> Self {
@@ -1630,41 +1568,11 @@ impl<T> Default for Iter<'_, T> {
     }
 }
 
-impl<T: Clone + Ord> Iterator for IntoIter<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
+forward_iterator! {
+    impl[T: Clone + Ord] IntoIter<T>;
+    Item = T;
+    terminals = sorted;
 }
-
-impl<T: Clone + Ord> DoubleEndedIterator for IntoIter<T> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n)
-    }
-}
-
-impl<T: Clone + Ord> ExactSizeIterator for IntoIter<T> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<T: Clone + Ord> FusedIterator for IntoIter<T> {}
 
 impl<T: fmt::Debug> fmt::Debug for IntoIter<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1687,35 +1595,11 @@ impl<T> Default for IntoIter<T> {
     }
 }
 
-impl<'a, T> Iterator for Range<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<&'a T> {
-        self.inner.next().map(|(k, ())| k)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<&'a T> {
-        self.inner.nth(n).map(|(k, ())| k)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
-}
-
-impl<'a, T> DoubleEndedIterator for Range<'a, T> {
-    fn next_back(&mut self) -> Option<&'a T> {
-        self.inner.next_back().map(|(k, ())| k)
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<&'a T> {
-        self.inner.nth_back(n).map(|(k, ())| k)
-    }
-}
-
-impl<T> ExactSizeIterator for Range<'_, T> {
+forward_iterator! {
+    impl['a, T] Range<'a, T>;
+    Item = &'a T;
+    map = |(k, ())| k;
+    terminals = sorted;
     /// Returns the number of elements remaining in the range.
     ///
     /// # Examples
@@ -1729,12 +1613,7 @@ impl<T> ExactSizeIterator for Range<'_, T> {
     /// range.next_back();
     /// assert_eq!(range.len(), 2);
     /// ```
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
 }
-
-impl<T> FusedIterator for Range<'_, T> {}
 
 impl<T> Clone for Range<'_, T> {
     fn clone(&self) -> Self {
