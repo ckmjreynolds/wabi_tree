@@ -71,11 +71,16 @@
           with:
             toolchain: ${{ matrix.rust }}
         - uses: Swatinem/rust-cache@v2
+        - uses: taiki-e/install-action@nextest
         - run: cargo build --all-features
-        - run: cargo test --all-features
+        # nextest doesn't run doc tests, so they get their own step.
+        - run: cargo nextest run --all-features
+        - run: cargo test --doc --all-features
         # Release builds drop debug assertions, so run the suite there too (Linux stable only).
         - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
-          run: cargo test --all-features --release
+          run: cargo nextest run --all-features --release
+        - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+          run: cargo test --doc --all-features --release
 
     # Code coverage (Linux only, nightly for branch coverage)
     coverage:
@@ -90,8 +95,13 @@
             components: llvm-tools-preview
         - uses: Swatinem/rust-cache@v2
         - uses: taiki-e/install-action@cargo-llvm-cov
+        - uses: taiki-e/install-action@nextest
+        # Collect from the nextest and doc test runs, then report on both together.
         - name: Generate coverage
-          run: cargo +nightly-2026-10-17 llvm-cov --all-features --doctests --branch --lcov --output-path lcov.info
+          run: |
+            cargo +nightly-2026-10-17 llvm-cov --no-report --all-features --branch nextest
+            cargo +nightly-2026-10-17 llvm-cov --no-report --all-features --branch --doc
+            cargo +nightly-2026-10-17 llvm-cov report --doctests --branch --lcov --output-path lcov.info
         - name: Upload to Codecov
           uses: codecov/codecov-action@v7
           with:
