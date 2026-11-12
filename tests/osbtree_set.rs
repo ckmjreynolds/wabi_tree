@@ -4,6 +4,9 @@ use proptest::prelude::*;
 use wabi_tree::osbtree_set;
 use wabi_tree::{OSBTreeSet, Rank};
 
+mod common;
+use common::{Tagged, random_keys_deterministic, tagged};
+
 /// The number of operations to perform in each proptest case.
 const TEST_SIZE: usize = 10_000;
 
@@ -1193,17 +1196,6 @@ proptest! {
 
 // ─── Deterministic Insertion Pattern Tests ────────────────────────────────────
 
-/// Helper function to generate deterministic pseudo-random values using LCG.
-fn random_values_deterministic(n: usize) -> Vec<i64> {
-    let mut values = Vec::with_capacity(n);
-    let mut x: u64 = 12345; // Fixed seed for reproducibility
-    for _ in 0..n {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-        values.push((x >> 33) as i64);
-    }
-    values
-}
-
 mod insertion_pattern_tests {
     use super::*;
     use std::collections::BTreeSet;
@@ -1266,7 +1258,7 @@ mod insertion_pattern_tests {
     /// Tests random inserts match BTreeSet.
     #[test]
     fn random_inserts_match_btreeset() {
-        let values = random_values_deterministic(N);
+        let values = random_keys_deterministic(N);
         let mut os_set: OSBTreeSet<i64> = OSBTreeSet::new();
         let mut bt_set: BTreeSet<i64> = BTreeSet::new();
 
@@ -1321,7 +1313,7 @@ mod insertion_pattern_tests {
     /// Tests random contains operations match BTreeSet.
     #[test]
     fn random_contains_match_btreeset() {
-        let values = random_values_deterministic(N);
+        let values = random_keys_deterministic(N);
         let os_set: OSBTreeSet<i64> = values.iter().copied().collect();
         let bt_set: BTreeSet<i64> = values.iter().copied().collect();
 
@@ -1368,7 +1360,7 @@ mod insertion_pattern_tests {
     /// Tests random remove operations match BTreeSet.
     #[test]
     fn random_removes_match_btreeset() {
-        let values = random_values_deterministic(N);
+        let values = random_keys_deterministic(N);
         let mut os_set: OSBTreeSet<i64> = values.iter().copied().collect();
         let mut bt_set: BTreeSet<i64> = values.iter().copied().collect();
 
@@ -1418,7 +1410,7 @@ mod insertion_pattern_tests {
     /// Tests full CRUD cycle with random inserts then removes.
     #[test]
     fn random_insert_then_random_remove() {
-        let values = random_values_deterministic(N);
+        let values = random_keys_deterministic(N);
         let mut os_set: OSBTreeSet<i64> = OSBTreeSet::new();
         let mut bt_set: BTreeSet<i64> = BTreeSet::new();
 
@@ -1762,40 +1754,6 @@ fn is_subset_inconsistent_ord_does_not_panic() {
 }
 
 // ─── Bulk construction (FromIterator) ───────────────────────────────────────
-
-/// An element that compares by `key` alone, so `tag` shows which of several equal ones was kept.
-#[derive(Clone, Copy, Debug)]
-struct Tagged {
-    key: u8,
-    tag: usize,
-}
-
-impl PartialEq for Tagged {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for Tagged {}
-
-impl PartialOrd for Tagged {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Tagged {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-const fn tagged(key: u8, tag: usize) -> Tagged {
-    Tagged {
-        key,
-        tag,
-    }
-}
 
 fn assert_collect_matches_btreeset(values: &[Tagged]) {
     let os_set: OSBTreeSet<Tagged> = values.iter().copied().collect();

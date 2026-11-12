@@ -135,9 +135,9 @@ pub(super) fn clone_last_key<K: Clone>(nodes: &Arena<Node<K>>, leaf: Handle, _: 
 
 /// A separator source for [`RawOSBTreeMap::build_packed`] that hands out `separators`, as
 /// returned by `clone_separators` for the same entries, without cloning.
-fn hand_out<K>(separators: Vec<K>) -> impl FnMut(&Arena<Node<K>>, Handle, usize) -> K {
-    // Boundaries are asked for level by level, not in order, so each is taken by index.
-    let mut separators: Vec<Option<K>> = separators.into_iter().map(Some).collect();
+///
+/// Boundaries are asked for level by level, not in order, so each is taken by index.
+fn hand_out<K>(mut separators: Vec<Option<K>>) -> impl FnMut(&Arena<Node<K>>, Handle, usize) -> K {
     move |_, _, index| separators[index].take().expect("one separator per leaf boundary")
 }
 
@@ -263,7 +263,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
 
     /// Clones the separators a packed tree would need for the `len > 0` entries starting at rank
     /// `start` of this tree, walking the leaf chain from `start` once.
-    fn clone_separators(&self, start: usize, len: usize) -> Vec<K> {
+    fn clone_separators(&self, start: usize, len: usize) -> Vec<Option<K>> {
         let (mut leaf, mut index) = self.locate_rank(start).expect("`clone_separators()` - start in range");
         let mut offset = 0;
         separator_positions(len)
@@ -275,7 +275,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                     let rest = node.key_count() - index;
                     if skip < rest {
                         index += skip;
-                        return node.key(index).clone();
+                        return Some(node.key(index).clone());
                     }
                     skip -= rest;
                     (leaf, index) = (node.next().expect("`clone_separators()` - range in tree"), 0);
@@ -406,13 +406,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 debug_assert!(separator.is_none(), "`fix_leaf_pair()` - merging needs no separator");
                 let (_, right_handle, _) = self.nodes.get_mut(parent).as_internal_mut().remove_child(index);
                 debug_assert_eq!(right_handle, right);
-                let right_leaf = self.nodes.take(right).into_leaf();
-                let left_leaf = self.nodes.get_mut(left).as_leaf_mut();
-                left_leaf.merge_with_right(right_leaf);
-                match left_leaf.next() {
-                    Some(next) => self.nodes.get_mut(next).as_leaf_mut().set_prev(Some(left)),
-                    None => self.last_leaf = Some(left),
-                }
+                self.absorb_right_leaf(left, right);
                 let merged_size = Size::from_usize(left_len + right_len);
                 self.nodes.get_mut(parent).as_internal_mut().set_child_size(index, merged_size);
             }
@@ -627,7 +621,7 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
                 // keeping their keys but `other`'s values, and take the result.
                 core::mem::swap(self, other);
                 for (key, value) in other.drain_to_vec() {
-                    drop(self.insert_key_keep_value(key, value));
+                    self.replace_key(key, value);
                 }
             } else {
                 let merged = merge_sorted(self.drain_to_vec(), other.drain_to_vec());
@@ -740,14 +734,12 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
 
         if left_fill + right_fill <= max {
             debug_assert!(leaf_separator.is_none(), "`join_roots()` - merging needs no separator");
-            let right_node = self.nodes.take(right);
             if leaves {
                 drop(separator);
-                // The two leaves were the whole chain; the merged one ends it.
-                self.nodes.get_mut(left).as_leaf_mut().merge_with_right(right_node.into_leaf());
-                self.last_leaf = Some(left);
+                self.absorb_right_leaf(left, right);
             } else {
-                self.nodes.get_mut(left).as_internal_mut().merge_with_right(separator, right_node.into_internal());
+                let right_node = self.nodes.take(right).into_internal();
+                self.nodes.get_mut(left).as_internal_mut().merge_with_right(separator, right_node);
             }
             return;
         }
@@ -773,7 +765,7 @@ struct JoinClones<K> {
     /// The max key of whichever tree is on the left.
     join_separator: K,
     /// The separators for the grafted tree, built packed.
-    separators: Vec<K>,
+    separators: Vec<Option<K>>,
     /// The separator for a leaf-level split or top-up, if one will be needed.
     leaf_separator: Option<K>,
 }

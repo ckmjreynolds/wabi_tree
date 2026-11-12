@@ -13,6 +13,7 @@ mod entry;
 mod order_statistic;
 
 pub use crate::Rank;
+use entry::EntryPath;
 pub use entry::{Entry, OccupiedEntry, VacantEntry};
 
 /// Validates that the start bound does not exceed the end bound.
@@ -452,10 +453,14 @@ pub struct ExtractIf<'a, K, V, R, F> {
 
 pub(crate) struct ExtractIfInner<'a, K, V, R> {
     tree: &'a mut RawOSBTreeMap<K, V>,
-    /// Keys to potentially extract (collected upfront)
-    keys: alloc::vec::Vec<K>,
-    /// Current index in keys
-    index: usize,
+    /// Rank of the next element to offer the predicate.
+    rank: usize,
+    /// Position of that element, if known. A rejected element's successor is the next one
+    /// along the leaf chain; after an extraction the tree may have rebalanced, so the next
+    /// element is found by rank.
+    position: Option<(Handle, usize)>,
+    /// How many elements of the range are still to be offered.
+    remaining: usize,
     _marker: PhantomData<R>,
 }
 
@@ -464,25 +469,31 @@ impl<K: Clone + Ord, V, R: RangeBounds<K>> ExtractIfInner<'_, K, V, R> {
     where
         F: FnMut(&K, &mut V) -> bool,
     {
-        while self.index < self.keys.len() {
-            let key = &self.keys[self.index];
-            self.index += 1;
-
-            // Get mutable access to the value to check predicate.
-            // The borrow must end before we call remove_entry, so we scope it.
-            let should_remove = self.tree.get_mut(key).is_some_and(|value| pred(key, value));
-            if should_remove {
-                // Remove and return
-                if let Some(entry) = self.tree.remove_entry(key) {
-                    return Some(entry);
+        while self.remaining > 0 && self.rank < self.tree.len() {
+            self.remaining -= 1;
+            let rejected = if let Some((leaf_handle, index)) = self.position {
+                let (key, value) = self.tree.key_value_mut(leaf_handle, index);
+                if pred(key, value) {
+                    // Extracting an element moves the next one down into its rank.
+                    self.position = None;
+                    return self.tree.remove_by_rank(self.rank);
                 }
-            }
+                (leaf_handle, index)
+            } else {
+                // One descent finds the element and, if the predicate accepts it, removes it.
+                match self.tree.remove_by_rank_if(self.rank, &mut *pred) {
+                    Ok(entry) => return Some(entry),
+                    Err(position) => position,
+                }
+            };
+            self.position = self.tree.position_after(rejected.0, rejected.1);
+            self.rank += 1;
         }
         None
     }
 
     pub(crate) fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.keys.len() - self.index))
+        (0, Some(self.remaining))
     }
 }
 
@@ -678,12 +689,10 @@ impl<K, V> OSBTreeMap<K, V> {
         K: Ord + Clone,
     {
         let (leaf_handle, index) = self.raw.first_position()?;
-        let key = self.raw.node(leaf_handle).as_leaf().key(index).clone();
         Some(OccupiedEntry {
-            key,
             leaf_handle,
             index,
-            recorded_path: false,
+            path: EntryPath::First,
             tree: &mut self.raw,
         })
     }
@@ -771,12 +780,10 @@ impl<K, V> OSBTreeMap<K, V> {
         K: Ord + Clone,
     {
         let (leaf_handle, index) = self.raw.last_position()?;
-        let key = self.raw.node(leaf_handle).as_leaf().key(index).clone();
         Some(OccupiedEntry {
-            key,
             leaf_handle,
             index,
-            recorded_path: false,
+            path: EntryPath::Last,
             tree: &mut self.raw,
         })
     }
@@ -975,27 +982,15 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// # Complexity
     ///
-    /// O(n log n) in the worst case (when many elements are removed).
+    /// O(n + k log n) where k is the number of elements removed.
     pub fn retain<F>(&mut self, mut f: F)
     where
         K: Clone + Ord,
         F: FnMut(&K, &mut V) -> bool,
     {
-        // Collect keys to remove first, since we can't modify while iterating
-        let keys_to_remove: alloc::vec::Vec<K> = self
-            .iter_mut()
-            .filter_map(|(k, v)| {
-                if f(k, v) {
-                    None
-                } else {
-                    Some(k.clone())
-                }
-            })
-            .collect();
-
-        for key in keys_to_remove {
-            self.raw.remove(&key);
-        }
+        // Extract, and drop, every element `f` rejects.
+        let mut doomed = self.extract_if_inner(..);
+        while doomed.next(&mut |k, v| !f(k, v)).is_some() {}
     }
 
     /// Moves all elements from `other` into `self`, leaving `other` empty.
@@ -1161,10 +1156,9 @@ impl<K, V> OSBTreeMap<K, V> {
     {
         match self.raw.search_recording_path(&key) {
             Ok((leaf_handle, index)) => Entry::Occupied(OccupiedEntry {
-                key,
                 leaf_handle,
                 index,
-                recorded_path: true,
+                path: EntryPath::Recorded,
                 tree: &mut self.raw,
             }),
             Err(position) => Entry::Vacant(VacantEntry {
@@ -1257,9 +1251,10 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// # Complexity
     ///
-    /// O(m + k log n) where m is the number of elements in the range and k is
-    /// the number of elements extracted. All keys in the range are collected
-    /// upfront, then each extracted element requires a O(log n) removal.
+    /// O(m + k log n) where m is the number of elements in the range and k is the
+    /// number extracted: rejected elements are passed over along the leaves, and each
+    /// extracted one costs a descent. No keys are cloned and nothing is allocated up
+    /// front, though removing an element may clone a key to rebalance the tree.
     pub fn extract_if<F, R>(&mut self, range: R, pred: F) -> ExtractIf<'_, K, V, R, F>
     where
         K: Clone + Ord,
@@ -1272,21 +1267,27 @@ impl<K, V> OSBTreeMap<K, V> {
         }
     }
 
+    /// Inserts `key` with `value`, unless an equal key is present: then `key` takes the stored
+    /// key's place, the stored value stays, and the old key is returned.
+    pub(crate) fn replace_key(&mut self, key: K, value: V) -> Option<K>
+    where
+        K: Clone + Ord,
+    {
+        self.raw.replace_key(key, value)
+    }
+
     pub(crate) fn extract_if_inner<R>(&mut self, range: R) -> ExtractIfInner<'_, K, V, R>
     where
         K: Clone + Ord,
         R: RangeBounds<K>,
     {
-        // Collect keys in range upfront
-        let keys: alloc::vec::Vec<K> = self
-            .range::<K, _>((range.start_bound().cloned(), range.end_bound().cloned()))
-            .map(|(k, _)| k.clone())
-            .collect();
-
+        validate_range_bounds(&range);
+        let cursor = self.raw.range_cursor(&range);
         ExtractIfInner {
             tree: &mut self.raw,
-            keys,
-            index: 0,
+            rank: cursor.start_rank,
+            position: cursor.front_leaf.map(|leaf_handle| (leaf_handle, cursor.front_index)),
+            remaining: cursor.len,
             _marker: PhantomData,
         }
     }
@@ -1371,12 +1372,7 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// O(1) to create the iterator; O(1) per iteration step via linked leaves.
     pub fn iter(&self) -> Iter<'_, K, V> {
-        let span = Span::new(self.raw.full_cursor());
-        Iter {
-            tree: &raw const self.raw,
-            span,
-            _marker: PhantomData,
-        }
+        Iter::from_cursor(&raw const self.raw, self.raw.full_cursor())
     }
 
     /// Gets a mutable iterator over the entries of the map, sorted by key.
@@ -1404,12 +1400,8 @@ impl<K, V> OSBTreeMap<K, V> {
     ///
     /// O(1) to create the iterator; O(1) per iteration step via linked leaves.
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
-        let span = Span::new(self.raw.full_cursor());
-        IterMut {
-            tree: &raw mut self.raw,
-            span,
-            _marker: PhantomData,
-        }
+        let cursor = self.raw.full_cursor();
+        IterMut::from_cursor(&raw mut self.raw, cursor)
     }
 
     /// Gets an iterator over the keys of the map, in sorted order.
@@ -1863,41 +1855,11 @@ impl<'a, K: 'a, V: 'a> Default for IterMut<'a, K, V> {
     }
 }
 
-impl<K, V> Iterator for IntoIter<K, V> {
-    type Item = (K, V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
+forward_iterator! {
+    impl[K, V] IntoIter<K, V>;
+    Item = (K, V);
+    terminals = sorted;
 }
-
-impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n)
-    }
-}
-
-impl<K, V> ExactSizeIterator for IntoIter<K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<K, V> FusedIterator for IntoIter<K, V> {}
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IntoIter<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1920,41 +1882,12 @@ impl<K, V> Default for IntoIter<K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for Keys<'a, K, V> {
-    type Item = &'a K;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n).map(|(k, _)| k)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
+forward_iterator! {
+    impl['a, K, V] Keys<'a, K, V>;
+    Item = &'a K;
+    map = |(k, _)| k;
+    terminals = sorted;
 }
-
-impl<K, V> DoubleEndedIterator for Keys<'_, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(k, _)| k)
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n).map(|(k, _)| k)
-    }
-}
-
-impl<K, V> ExactSizeIterator for Keys<'_, K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<K, V> FusedIterator for Keys<'_, K, V> {}
 
 impl<K: fmt::Debug, V> fmt::Debug for Keys<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1985,41 +1918,11 @@ impl<K, V> Clone for Keys<'_, K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for Values<'a, K, V> {
-    type Item = &'a V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n).map(|(_, v)| v)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!();
+forward_iterator! {
+    impl['a, K, V] Values<'a, K, V>;
+    Item = &'a V;
+    map = |(_, v)| v;
 }
-
-impl<K, V> DoubleEndedIterator for Values<'_, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(_, v)| v)
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n).map(|(_, v)| v)
-    }
-}
-
-impl<K, V> ExactSizeIterator for Values<'_, K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<K, V> FusedIterator for Values<'_, K, V> {}
 
 impl<K, V> Clone for Values<'_, K, V> {
     fn clone(&self) -> Self {
@@ -2050,41 +1953,11 @@ impl<K, V: fmt::Debug> fmt::Debug for Values<'_, K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
-    type Item = &'a mut V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n).map(|(_, v)| v)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!();
+forward_iterator! {
+    impl['a, K, V] ValuesMut<'a, K, V>;
+    Item = &'a mut V;
+    map = |(_, v)| v;
 }
-
-impl<K, V> DoubleEndedIterator for ValuesMut<'_, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(_, v)| v)
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n).map(|(_, v)| v)
-    }
-}
-
-impl<K, V> ExactSizeIterator for ValuesMut<'_, K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<K, V> FusedIterator for ValuesMut<'_, K, V> {}
 
 impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2107,41 +1980,12 @@ impl<K, V> Default for ValuesMut<'_, K, V> {
     }
 }
 
-impl<K: Clone + Ord, V> Iterator for IntoKeys<K, V> {
-    type Item = K;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n).map(|(k, _)| k)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
+forward_iterator! {
+    impl[K: Clone + Ord, V] IntoKeys<K, V>;
+    Item = K;
+    map = |(k, _)| k;
+    terminals = sorted;
 }
-
-impl<K: Clone + Ord, V> DoubleEndedIterator for IntoKeys<K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(k, _)| k)
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n).map(|(k, _)| k)
-    }
-}
-
-impl<K: Clone + Ord, V> ExactSizeIterator for IntoKeys<K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<K: Clone + Ord, V> FusedIterator for IntoKeys<K, V> {}
 
 impl<K: fmt::Debug, V> fmt::Debug for IntoKeys<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2164,41 +2008,11 @@ impl<K, V> Default for IntoKeys<K, V> {
     }
 }
 
-impl<K: Clone + Ord, V> Iterator for IntoValues<K, V> {
-    type Item = V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n).map(|(_, v)| v)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!();
+forward_iterator! {
+    impl[K: Clone + Ord, V] IntoValues<K, V>;
+    Item = V;
+    map = |(_, v)| v;
 }
-
-impl<K: Clone + Ord, V> DoubleEndedIterator for IntoValues<K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(_, v)| v)
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n).map(|(_, v)| v)
-    }
-}
-
-impl<K: Clone + Ord, V> ExactSizeIterator for IntoValues<K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<K: Clone + Ord, V> FusedIterator for IntoValues<K, V> {}
 
 impl<K, V: fmt::Debug> fmt::Debug for IntoValues<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2221,40 +2035,10 @@ impl<K, V> Default for IntoValues<K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for Range<'a, K, V> {
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
-}
-
-impl<K, V> DoubleEndedIterator for Range<'_, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n)
-    }
-}
-
-impl<K, V> FusedIterator for Range<'_, K, V> {}
-
-impl<K, V> ExactSizeIterator for Range<'_, K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
+forward_iterator! {
+    impl['a, K, V] Range<'a, K, V>;
+    Item = (&'a K, &'a V);
+    terminals = sorted;
 }
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Range<'_, K, V> {
@@ -2286,40 +2070,10 @@ impl<K, V> Clone for Range<'_, K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for RangeMut<'a, K, V> {
-    type Item = (&'a K, &'a mut V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-
-    o1_terminals!(sorted);
-}
-
-impl<K, V> DoubleEndedIterator for RangeMut<'_, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth_back(n)
-    }
-}
-
-impl<K, V> FusedIterator for RangeMut<'_, K, V> {}
-
-impl<K, V> ExactSizeIterator for RangeMut<'_, K, V> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
+forward_iterator! {
+    impl['a, K, V] RangeMut<'a, K, V>;
+    Item = (&'a K, &'a mut V);
+    terminals = sorted;
 }
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for RangeMut<'_, K, V> {
@@ -2345,10 +2099,7 @@ impl<K, V> Default for RangeMut<'_, K, V> {
 
 impl<K, V, R, F> fmt::Debug for ExtractIf<'_, K, V, R, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExtractIf")
-            .field("index", &self.inner.index)
-            .field("remaining", &(self.inner.keys.len() - self.inner.index))
-            .finish()
+        f.debug_struct("ExtractIf").field("rank", &self.inner.rank).field("remaining", &self.inner.remaining).finish()
     }
 }
 

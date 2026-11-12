@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
+use std::ops::{Bound, RangeBounds};
 
 use proptest::prelude::*;
 use wabi_tree::osbtree_map;
 use wabi_tree::{OSBTreeMap, Rank};
+
+mod common;
+use common::{Tagged, random_keys_deterministic, tagged};
 
 /// The number of operations to perform in each proptest case.
 const TEST_SIZE: usize = 10_000;
@@ -1040,8 +1044,6 @@ proptest! {
 }
 
 // ─── Range edge cases (empty ranges, leaf boundaries, tuple bounds) ──────────
-
-use core::ops::Bound;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
@@ -2232,17 +2234,6 @@ mod key_identity_tests {
 
 // ─── Deterministic Insertion Pattern Tests ────────────────────────────────────
 
-/// Helper function to generate deterministic pseudo-random keys using LCG.
-fn random_keys_deterministic(n: usize) -> Vec<i64> {
-    let mut keys = Vec::with_capacity(n);
-    let mut x: u64 = 12345; // Fixed seed for reproducibility
-    for _ in 0..n {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-        keys.push((x >> 33) as i64);
-    }
-    keys
-}
-
 mod insertion_pattern_tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -3139,40 +3130,6 @@ fn terminals_on_empty_and_exhausted_iterators() {
 
 // ─── Bulk construction (FromIterator) ───────────────────────────────────────
 
-/// A key that compares by `key` alone, so `tag` shows which of several equal keys was kept.
-#[derive(Clone, Copy, Debug)]
-struct Tagged {
-    key: u8,
-    tag: usize,
-}
-
-impl PartialEq for Tagged {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for Tagged {}
-
-impl PartialOrd for Tagged {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Tagged {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-const fn tagged(key: u8, tag: usize) -> Tagged {
-    Tagged {
-        key,
-        tag,
-    }
-}
-
 /// Tags each key with its position in `keys`, and pairs it with an arbitrary value.
 fn tagged_entries(keys: &[u8]) -> Vec<(Tagged, usize)> {
     keys.iter().enumerate().map(|(tag, &key)| (tagged(key, tag), tag * 10)).collect()
@@ -3498,4 +3455,122 @@ fn with_rank_methods_take_borrowed_keys() {
     assert_eq!(map.remove_with_rank("z"), None);
     assert_eq!(map.remove_by_rank(0), Some(("a".to_string(), 1)));
     assert_eq!(map.remove_by_rank(2), None);
+}
+
+// ─── extract_if / retain over runs of accepted and rejected elements ─────────
+
+/// `extract_if` walks the leaves past rejected elements and descends by rank to remove
+/// accepted ones, so mix runs of both, across leaf boundaries, and check it against a model.
+#[test]
+fn extract_if_and_retain_match_model_for_mixed_runs() {
+    const N: u32 = 5_000;
+    type Pred = fn(u32) -> bool;
+    let preds: [(&str, Pred); 7] = [
+        ("none", |_| false),
+        ("all", |_| true),
+        ("alternate", |k| k % 2 == 0),
+        ("sparse", |k| k % 97 == 0),
+        ("dense", |k| k % 97 != 0),
+        ("short runs", |k| k % 10 < 3),
+        ("long runs", |k| (k / 300) % 2 == 0),
+    ];
+    let ranges: [(Bound<u32>, Bound<u32>); 5] = [
+        (Bound::Unbounded, Bound::Unbounded),
+        (Bound::Included(1_234), Bound::Excluded(3_456)),
+        (Bound::Excluded(4_000), Bound::Unbounded),
+        (Bound::Unbounded, Bound::Included(63)),
+        (Bound::Included(2_500), Bound::Included(2_500)),
+    ];
+
+    for (name, pred) in preds {
+        for range in ranges {
+            let mut map: OSBTreeMap<u32, u32> = (0..N).map(|k| (k, k)).collect();
+            let offered: Vec<u32> = map
+                .extract_if(range, |&k, v| {
+                    *v += 1;
+                    pred(k)
+                })
+                .map(|(k, v)| {
+                    assert_eq!(v, k + 1, "{name}: extracted value was offered once");
+                    k
+                })
+                .collect();
+
+            let in_range = |k: &u32| range.contains(k);
+            let expected: Vec<u32> = (0..N).filter(|k| in_range(k) && pred(*k)).collect();
+            assert_eq!(offered, expected, "{name} {range:?}: extracted");
+
+            let kept: Vec<(u32, u32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+            let expected_kept: Vec<(u32, u32)> =
+                (0..N).filter(|k| !(in_range(k) && pred(*k))).map(|k| (k, k + u32::from(in_range(&k)))).collect();
+            assert_eq!(kept, expected_kept, "{name} {range:?}: kept");
+            assert_eq!(map.len(), expected_kept.len());
+            for (rank, &(k, _)) in expected_kept.iter().enumerate().step_by(37) {
+                assert_eq!(map.rank_of(&k), Some(rank), "{name} {range:?}: rank of {k}");
+            }
+        }
+
+        let mut map: OSBTreeMap<u32, u32> = (0..N).map(|k| (k, k)).collect();
+        map.retain(|&k, _| !pred(k));
+        assert!(map.keys().copied().eq((0..N).filter(|&k| !pred(k))), "{name}: retain");
+    }
+}
+
+// ─── entry removal under an inconsistent `Ord` ───────────────────────────────
+
+thread_local! {
+    static FICKLE_REVERSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A key whose order flips while it is in the map, which `Ord` forbids but can't prevent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fickle(u32);
+
+impl PartialOrd for Fickle {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Fickle {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let ordering = self.0.cmp(&other.0);
+        if FICKLE_REVERSED.get() {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    }
+}
+
+/// `first_entry` and `last_entry` remove along the leftmost and rightmost paths, so they
+/// compare no keys and stay correct even when the keys' order has changed under the map.
+#[test]
+fn first_and_last_entry_remove_without_comparing_keys() {
+    const N: u32 = 2_000;
+    let mut map: OSBTreeMap<Fickle, u32> = (0..N).map(|k| (Fickle(k), k)).collect();
+
+    FICKLE_REVERSED.set(true);
+    for k in 0..N / 2 {
+        assert_eq!(map.first_entry().unwrap().remove_entry(), (Fickle(k), k));
+    }
+    assert!(map.values().copied().eq(N / 2..N));
+    for k in (N / 2..N).rev() {
+        assert_eq!(map.last_entry().unwrap().remove(), k);
+        assert_eq!(map.len(), (k - N / 2) as usize);
+    }
+    FICKLE_REVERSED.set(false);
+
+    assert!(map.is_empty());
+}
+
+/// An entry that has to search for its own key panics if the search misses, rather than
+/// removing along another element's path and corrupting the sizes.
+#[test]
+#[should_panic(expected = "entry must exist")]
+fn inserted_entry_remove_panics_when_ord_changes() {
+    let mut map: OSBTreeMap<Fickle, u32> = (0..2_000).step_by(2).map(|k| (Fickle(k), k)).collect();
+    let entry = map.entry(Fickle(11)).insert_entry(11);
+    FICKLE_REVERSED.set(true);
+    entry.remove();
 }

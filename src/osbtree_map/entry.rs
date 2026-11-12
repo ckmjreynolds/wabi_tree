@@ -92,13 +92,24 @@ impl<K: fmt::Debug + Ord + Clone, V> fmt::Debug for VacantEntry<'_, K, V> {
 /// assert_eq!(map["oz"], 2);
 /// ```
 pub struct OccupiedEntry<'a, K, V> {
-    pub(crate) key: K,
     pub(crate) leaf_handle: Handle,
     pub(crate) index: usize,
-    /// Whether the tree holds the descent path to this entry, recorded by the search that made
-    /// it. If so, removing uses that path; if not, removing searches for the key again.
-    pub(crate) recorded_path: bool,
+    pub(crate) path: EntryPath,
     pub(crate) tree: &'a mut RawOSBTreeMap<K, V>,
+}
+
+/// How an [`OccupiedEntry`] gets the descent path that removing it needs.
+#[derive(Clone, Copy)]
+pub(crate) enum EntryPath {
+    /// The tree holds the path, recorded by the search that made the entry.
+    Recorded,
+    /// The entry is the first element: the path is all leftmost children, found without
+    /// comparing keys.
+    First,
+    /// The entry is the last element: the path is all rightmost children.
+    Last,
+    /// The path is found again by searching for the stored key.
+    Search,
 }
 
 impl<K: fmt::Debug + Ord + Clone, V: fmt::Debug> fmt::Debug for OccupiedEntry<'_, K, V> {
@@ -396,23 +407,26 @@ impl<'a, K: Ord + Clone, V> VacantEntry<'a, K, V> {
     ///
     /// O(log n)
     pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
-        let key = self.key.clone();
         let (leaf_handle, index) = match self.position {
-            Some((leaf_handle, index)) => self.tree.insert_at_recorded(leaf_handle, index, key, value).1,
-            None => self.tree.insert_with_position(key, value).0,
+            Some((leaf_handle, index)) => self.tree.insert_at_recorded(leaf_handle, index, self.key, value).1,
+            None => self.tree.insert_with_position(self.key, value).0,
         };
         // Inserting consumed the recorded path.
         OccupiedEntry {
-            key: self.key,
             leaf_handle,
             index,
-            recorded_path: false,
+            path: EntryPath::Search,
             tree: self.tree,
         }
     }
 }
 
 impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
+    /// The handle of this entry's value in the tree's value arena.
+    fn value_handle(&self) -> Handle {
+        self.tree.node(self.leaf_handle).as_leaf().value(self.index)
+    }
+
     /// Gets a reference to the key in the entry.
     ///
     /// Note: This returns the key that is actually stored in the map, not the
@@ -466,11 +480,13 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     /// # Complexity
     ///
     /// O(log n)
+    #[allow(clippy::must_use_candidate)]
     pub fn remove_entry(self) -> (K, V) {
-        if self.recorded_path {
-            self.tree.remove_at_recorded(self.leaf_handle, self.index)
-        } else {
-            self.tree.remove_entry(&self.key).expect("entry must exist")
+        match self.path {
+            EntryPath::Recorded => self.tree.remove_at_recorded(self.leaf_handle, self.index),
+            EntryPath::First => self.tree.pop_first().expect("`remove_entry()` - entry must exist"),
+            EntryPath::Last => self.tree.pop_last().expect("`remove_entry()` - entry must exist"),
+            EntryPath::Search => self.tree.remove_at_position(self.leaf_handle, self.index),
         }
     }
 
@@ -495,9 +511,7 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     /// O(1)
     #[must_use]
     pub fn get(&self) -> &V {
-        let leaf = self.tree.node(self.leaf_handle).as_leaf();
-        let value_handle = leaf.value(self.index);
-        self.tree.value(value_handle)
+        self.tree.value(self.value_handle())
     }
 
     /// Gets a mutable reference to the value in the entry.
@@ -531,9 +545,7 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     ///
     /// O(1)
     pub fn get_mut(&mut self) -> &mut V {
-        let leaf = self.tree.node(self.leaf_handle).as_leaf();
-        let value_handle = leaf.value(self.index);
-        self.tree.value_mut(value_handle)
+        self.tree.value_mut(self.value_handle())
     }
 
     /// Converts the entry into a mutable reference to its value.
@@ -563,9 +575,7 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     /// O(1)
     #[must_use = "`self` will be dropped if the result is not used"]
     pub fn into_mut(self) -> &'a mut V {
-        let leaf = self.tree.node(self.leaf_handle).as_leaf();
-        let value_handle = leaf.value(self.index);
-        self.tree.value_mut(value_handle)
+        self.tree.value_mut(self.value_handle())
     }
 
     /// Sets the value of the entry with the `OccupiedEntry`'s key,
@@ -614,6 +624,7 @@ impl<'a, K: Ord + Clone, V> OccupiedEntry<'a, K, V> {
     /// # Complexity
     ///
     /// O(log n)
+    #[allow(clippy::must_use_candidate)]
     pub fn remove(self) -> V {
         self.remove_entry().1
     }

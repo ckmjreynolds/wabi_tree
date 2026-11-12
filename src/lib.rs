@@ -103,6 +103,65 @@ macro_rules! o1_terminals {
     };
 }
 
+/// Implements `Iterator`, `DoubleEndedIterator`, `ExactSizeIterator` and `FusedIterator` for an
+/// iterator that wraps a double-ended, exact-size iterator in its `inner` field.
+///
+/// `map` projects each of the inner iterator's items to `Item`; leave it out when they are the
+/// same. `terminals = sorted` is passed on to [`o1_terminals!`]. Attributes after the last field
+/// (doc comments, usually) are applied to `len`.
+macro_rules! forward_iterator {
+    (
+        impl[$($generics:tt)*] $ty:ty;
+        Item = $item:ty;
+        $(map = $map:expr;)?
+        $(terminals = $terminals:ident;)?
+        $(#[$len_meta:meta])*
+    ) => {
+        impl<$($generics)*> Iterator for $ty {
+            type Item = $item;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                forward_iterator!(@item self.inner.next() $(, $map)?)
+            }
+
+            fn nth(&mut self, n: usize) -> Option<Self::Item> {
+                forward_iterator!(@item self.inner.nth(n) $(, $map)?)
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.inner.size_hint()
+            }
+
+            o1_terminals!($($terminals)?);
+        }
+
+        impl<$($generics)*> DoubleEndedIterator for $ty {
+            fn next_back(&mut self) -> Option<Self::Item> {
+                forward_iterator!(@item self.inner.next_back() $(, $map)?)
+            }
+
+            fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+                forward_iterator!(@item self.inner.nth_back(n) $(, $map)?)
+            }
+        }
+
+        impl<$($generics)*> ExactSizeIterator for $ty {
+            $(#[$len_meta])*
+            fn len(&self) -> usize {
+                self.inner.len()
+            }
+        }
+
+        impl<$($generics)*> core::iter::FusedIterator for $ty {}
+    };
+    (@item $item:expr) => {
+        $item
+    };
+    (@item $item:expr, $map:expr) => {
+        $item.map($map)
+    };
+}
+
 mod order_statistic;
 mod raw;
 
