@@ -6,6 +6,10 @@
 //!
 //! - [`get_by_rank`](OSBTreeMap::get_by_rank) - Get the element at a given sorted position
 //! - [`rank_of`](OSBTreeMap::rank_of) - Get the sorted position of a key
+//! - [`remove_by_rank`](OSBTreeMap::remove_by_rank) - Remove the element at a given sorted position
+//! - [`get_with_rank`](OSBTreeMap::get_with_rank), [`insert_with_rank`](OSBTreeMap::insert_with_rank)
+//!   and [`remove_with_rank`](OSBTreeMap::remove_with_rank) - Look up, insert or remove by key and
+//!   get the element's sorted position from the same walk down the tree
 //! - Indexing by [`Rank`] - e.g., `map[Rank(0)]` for the first element
 //!
 //! # Example

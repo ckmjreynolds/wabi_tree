@@ -149,6 +149,9 @@ fn entries_and_rank_access_mutate_in_place() {
     }
     *map.get_by_rank_mut(6).unwrap().1 = 66;
     map[Rank(7)] = 77;
+    *map.get_with_rank_mut(&8).unwrap().2 = 88;
+    assert_eq!(map.remove_by_rank(9), Some((9, 9)));
+    assert_eq!(map.remove_with_rank(&10), Some((9, 10, 10)));
 
     assert_eq!(map.get(&N), Some(&7));
     assert_eq!(map.get(&3), Some(&10));
@@ -156,6 +159,8 @@ fn entries_and_rank_access_mutate_in_place() {
     assert_eq!(map.get(&5), Some(&55));
     assert_eq!(map.get(&6), Some(&66));
     assert_eq!(map.get(&7), Some(&77));
+    assert_eq!(map.get_with_rank(&8), Some((8, &8, &88)));
+    assert_eq!(map.get(&9), None);
 }
 
 #[test]

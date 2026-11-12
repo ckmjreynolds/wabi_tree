@@ -14,7 +14,7 @@ use core::ops::RangeBounds;
 
 use smallvec::SmallVec;
 
-use super::{Path, PathElement, RawOSBTreeMap, child_for_rank};
+use super::{Path, PathElement, RawOSBTreeMap};
 use crate::raw::arena::Arena;
 use crate::raw::handle::Handle;
 use crate::raw::node::{InternalNode, LeafNode, MAX_CHILDREN, MAX_KEYS, MIN_CHILDREN, MIN_LEAF_KEYS, Node};
@@ -298,17 +298,6 @@ impl<K: Clone + Ord, V> RawOSBTreeMap<K, V> {
             height += 1;
         }
         height
-    }
-
-    /// Descends to the element at `rank`, recording the path. Returns its leaf and index.
-    fn descend_to_rank(&self, root: Handle, rank: usize, path: &mut Path) -> (Handle, usize) {
-        let mut remaining = rank;
-        let leaf = self.descend_with_path(root, path, |internal| {
-            let (child, before) = child_for_rank(internal, remaining).expect("`descend_to_rank()` - rank in range");
-            remaining -= before;
-            child
-        });
-        (leaf, remaining)
     }
 
     // ─── Border fix-up ──────────────────────────────────────────────────────────

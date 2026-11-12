@@ -103,6 +103,167 @@ impl<K: Clone + Ord, V> OSBTreeMap<K, V> {
     {
         self.raw.rank_of(key)
     }
+
+    /// Returns the zero-based rank of `key` in sorted order together with the
+    /// stored key and value, or `None` if the key is not present.
+    ///
+    /// This is an order-statistic extension and is not part of the standard
+    /// `BTreeMap` API. It finds the element and its rank in one descent, where
+    /// [`rank_of`](Self::rank_of) followed by
+    /// [`get_key_value`](Self::get_key_value) takes two.
+    ///
+    /// The key may be any borrowed form of the map's key type, but the ordering
+    /// on the borrowed form *must* match the ordering on the key type.
+    ///
+    /// # Complexity
+    ///
+    /// O(log n)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wabi_tree::OSBTreeMap;
+    ///
+    /// let map = OSBTreeMap::from([("a", 10), ("b", 20), ("c", 30)]);
+    ///
+    /// assert_eq!(map.get_with_rank(&"b"), Some((1, &"b", &20)));
+    /// assert_eq!(map.get_with_rank(&"z"), None);
+    /// ```
+    #[must_use]
+    pub fn get_with_rank<Q>(&self, key: &Q) -> Option<(usize, &K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        self.raw.get_with_rank(key)
+    }
+
+    /// Returns the zero-based rank of `key` in sorted order together with the
+    /// stored key and a mutable reference to the value, or `None` if the key
+    /// is not present.
+    ///
+    /// This is an order-statistic extension and is not part of the standard
+    /// `BTreeMap` API. The key is returned as a shared reference because
+    /// mutating it would violate the map's ordering invariants.
+    ///
+    /// The key may be any borrowed form of the map's key type, but the ordering
+    /// on the borrowed form *must* match the ordering on the key type.
+    ///
+    /// # Complexity
+    ///
+    /// O(log n)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wabi_tree::OSBTreeMap;
+    ///
+    /// let mut map = OSBTreeMap::from([("a", 10), ("b", 20)]);
+    ///
+    /// if let Some((rank, _, value)) = map.get_with_rank_mut(&"b") {
+    ///     assert_eq!(rank, 1);
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(map[&"b"], 21);
+    /// ```
+    #[must_use]
+    pub fn get_with_rank_mut<Q>(&mut self, key: &Q) -> Option<(usize, &K, &mut V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        self.raw.get_with_rank_mut(key)
+    }
+
+    /// Inserts a key-value pair into the map and returns the key's zero-based
+    /// rank after the insertion, together with the old value if the key was
+    /// already present.
+    ///
+    /// This is an order-statistic extension and is not part of the standard
+    /// `BTreeMap` API. Apart from the rank it behaves like
+    /// [`insert`](Self::insert): if the key is present, its value is replaced
+    /// and the key itself is not updated.
+    ///
+    /// # Complexity
+    ///
+    /// O(log n)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wabi_tree::OSBTreeMap;
+    ///
+    /// let mut map = OSBTreeMap::from([("a", 10), ("c", 30)]);
+    ///
+    /// assert_eq!(map.insert_with_rank("b", 20), (1, None));
+    /// assert_eq!(map.insert_with_rank("c", 31), (2, Some(30)));
+    /// ```
+    pub fn insert_with_rank(&mut self, key: K, value: V) -> (usize, Option<V>) {
+        self.raw.insert_with_rank(key, value)
+    }
+
+    /// Removes a key from the map, returning its zero-based rank before the
+    /// removal together with the stored key and value, or `None` if the key
+    /// is not present.
+    ///
+    /// This is an order-statistic extension and is not part of the standard
+    /// `BTreeMap` API. It finds the element and its rank in one descent, where
+    /// [`rank_of`](Self::rank_of) followed by
+    /// [`remove_entry`](Self::remove_entry) takes two.
+    ///
+    /// The key may be any borrowed form of the map's key type, but the ordering
+    /// on the borrowed form *must* match the ordering on the key type.
+    ///
+    /// # Complexity
+    ///
+    /// O(log n)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wabi_tree::OSBTreeMap;
+    ///
+    /// let mut map = OSBTreeMap::from([("a", 10), ("b", 20), ("c", 30)]);
+    ///
+    /// assert_eq!(map.remove_with_rank(&"b"), Some((1, "b", 20)));
+    /// assert_eq!(map.remove_with_rank(&"b"), None);
+    /// assert_eq!(map.len(), 2);
+    /// ```
+    pub fn remove_with_rank<Q>(&mut self, key: &Q) -> Option<(usize, K, V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Ord,
+    {
+        self.raw.remove_entry_with_rank(key)
+    }
+
+    /// Removes and returns the key-value pair at position `rank` in sorted
+    /// order.
+    ///
+    /// This is an order-statistic extension and is not part of the standard
+    /// `BTreeMap` API.
+    ///
+    /// The rank is zero-based. Returns `None` if `rank` is out of bounds,
+    /// where `Vec::remove` would panic.
+    ///
+    /// # Complexity
+    ///
+    /// O(log n)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wabi_tree::OSBTreeMap;
+    ///
+    /// let mut map = OSBTreeMap::from([("a", 10), ("b", 20), ("c", 30)]);
+    ///
+    /// assert_eq!(map.remove_by_rank(1), Some(("b", 20)));
+    /// assert_eq!(map.remove_by_rank(2), None);
+    /// assert_eq!(map.len(), 2);
+    /// ```
+    pub fn remove_by_rank(&mut self, rank: usize) -> Option<(K, V)> {
+        self.raw.remove_by_rank(rank)
+    }
 }
 /// Indexes into the map by rank.
 ///

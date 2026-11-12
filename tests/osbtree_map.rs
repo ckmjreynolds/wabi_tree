@@ -3418,3 +3418,84 @@ fn panicking_key_clone_during_disjoint_append_leaves_both_maps_unchanged() {
         assert_matches_model(&map, &model);
     }
 }
+
+// ─── `_with_rank` and `remove_by_rank` (compared against the two-call form) ──
+
+#[derive(Debug, Clone)]
+enum RankOp {
+    Insert(i64, i64),
+    Remove(i64),
+    Get(i64),
+    GetMut(i64),
+    RemoveByRank(usize),
+}
+
+fn rank_op_strategy() -> impl Strategy<Value = RankOp> {
+    prop_oneof![
+        4 => (key_strategy(), value_strategy()).prop_map(|(k, v)| RankOp::Insert(k, v)),
+        2 => key_strategy().prop_map(RankOp::Remove),
+        2 => key_strategy().prop_map(RankOp::Get),
+        1 => key_strategy().prop_map(RankOp::GetMut),
+        1 => (0usize..TEST_SIZE).prop_map(RankOp::RemoveByRank),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// Replays random operations on an `OSBTreeMap` through the `_with_rank` methods and on a
+    /// `BTreeMap` through the plain ones, deriving each expected rank from the `BTreeMap`.
+    #[test]
+    fn with_rank_methods_match_btreemap(ops in proptest::collection::vec(rank_op_strategy(), TEST_SIZE)) {
+        let mut os_map: OSBTreeMap<i64, i64> = OSBTreeMap::new();
+        let mut bt_map: BTreeMap<i64, i64> = BTreeMap::new();
+
+        for op in ops {
+            match op {
+                RankOp::Insert(k, v) => {
+                    let old = bt_map.insert(k, v);
+                    let rank = bt_map.range(..k).count();
+                    prop_assert_eq!(os_map.insert_with_rank(k, v), (rank, old));
+                }
+                RankOp::Remove(k) => {
+                    let rank = bt_map.range(..k).count();
+                    let expected = bt_map.remove_entry(&k).map(|(k, v)| (rank, k, v));
+                    prop_assert_eq!(os_map.remove_with_rank(&k), expected);
+                }
+                RankOp::Get(k) => {
+                    let expected = bt_map.get_key_value(&k).map(|(k, v)| (bt_map.range(..k).count(), k, v));
+                    prop_assert_eq!(os_map.get_with_rank(&k), expected);
+                }
+                RankOp::GetMut(k) => {
+                    let rank = bt_map.range(..k).count();
+                    let expected = bt_map.get_mut(&k).map(|v| { *v = v.wrapping_add(1); (rank, k, *v) });
+                    let got = os_map.get_with_rank_mut(&k).map(|(r, k, v)| { *v = v.wrapping_add(1); (r, *k, *v) });
+                    prop_assert_eq!(got, expected);
+                }
+                RankOp::RemoveByRank(rank) => {
+                    let expected = bt_map.keys().nth(rank).copied().map(|k| bt_map.remove_entry(&k).unwrap());
+                    prop_assert_eq!(os_map.remove_by_rank(rank), expected);
+                }
+            }
+            prop_assert_eq!(os_map.len(), bt_map.len());
+        }
+
+        prop_assert!(os_map.iter().eq(bt_map.iter()));
+    }
+}
+
+#[test]
+fn with_rank_methods_take_borrowed_keys() {
+    let mut map: OSBTreeMap<String, i32> = ["b", "d", "f"].into_iter().map(|s| (s.to_string(), 0)).collect();
+
+    assert_eq!(map.get_with_rank("d"), Some((1, &"d".to_string(), &0)));
+    if let Some((rank, _, v)) = map.get_with_rank_mut("f") {
+        assert_eq!(rank, 2);
+        *v = 5;
+    }
+    assert_eq!(map.insert_with_rank("a".to_string(), 1), (0, None));
+    assert_eq!(map.remove_with_rank("f"), Some((3, "f".to_string(), 5)));
+    assert_eq!(map.remove_with_rank("z"), None);
+    assert_eq!(map.remove_by_rank(0), Some(("a".to_string(), 1)));
+    assert_eq!(map.remove_by_rank(2), None);
+}
